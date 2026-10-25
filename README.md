@@ -1,0 +1,129 @@
+# warp-socks5
+
+单容器 Cloudflare WARP SOCKS5 代理。进程内池化多个 WARP 隧道，每个隧道一个出口 IP。
+控制 API 收到 403/429 回报后淘汰对应隧道并后台注册新的，实现单容器无限换 IP。
+
+纯用户态（WireGuard-go + gVisor netstack），**不需要 TUN 设备、root、NET_ADMIN**。
+
+## 原理
+
+```
+启动 → 注册第 1 个隧道（同步）→ 后台填满池子（默认 4 个，12 秒间隔）
+运行 → 池里始终保持 N 个热隧道（N 个不同出口 IP）
+       → 每个 SOCKS5 连接轮询取一个
+       → 控制 API 报 403/429 → 淘汰该隧道 → 后台注册新隧道替换
+       → 用户永远拿到热隧道，不等注册
+```
+
+WARP 免费注册无次数上限，每次注册拿到独立 WireGuard 密钥和出口 IP，因此可以无限轮换。
+
+### 两种 IP 多样性档位
+
+| 模式 | 效果 | 要求 |
+|---|---|---|
+| 不开 `source-ipv6` | 每次注册新 /128 出口 IP，但可能落在同一个 /64 内 | 无 |
+| 开 `source-ipv6` | 每个隧道绑定 /64 前缀内随机源地址，不同源 → 不同公网 /64 → 真正跨配额域 | Linux + 宿主机有路由到的 IPv6 /64 |
+
+## 用法
+
+```sh
+# 直接运行
+./warp-socks5 -pool-size 4 -stack ipv6
+
+# 或用环境变量
+SOCKS5_LISTEN=:1080 CONTROL_LISTEN=:1081 WARP_POOL_SIZE=8 ./warp-socks5
+```
+
+### 参数
+
+| 参数 | 环境变量 | 默认 | 说明 |
+|---|---|---|---|
+| `-socks` | `SOCKS5_LISTEN` | `:1080` | SOCKS5 监听地址 |
+| `-control` | `CONTROL_LISTEN` | `:1081` | 控制 API 监听地址 |
+| `-pool-size` | `WARP_POOL_SIZE` | `4` | WARP 隧道池大小（1-32） |
+| `-stack` | `WARP_STACK` | `ipv6` | 隧道地址族：ipv4/ipv6/dual |
+| `-source-ipv6` | `WARP_SOURCE_IPV6` | 空 | 外层 IPv6 源前缀（/64 或更短） |
+| `-recent-window` | `WARP_RECENT_WINDOW` | `10s` | 无参惩罚回看时间窗口 |
+
+### 控制 API
+
+```sh
+# 查看池状态
+curl http://localhost:1081/snapshot
+# {"Stack":"ipv6","Size":4,"Active":4,"Standby":3,"Cooling":0,"Egress":["2606:...","2606:...",...]}
+
+# 健康检查
+curl http://localhost:1081/healthz
+
+# 惩罚特定出口（NovaVeil 知道 egress IP 时）
+curl -X POST 'http://localhost:1081/penalize?egress=2606:4700:...&reason=429'
+
+# 惩罚最近用过的出口（NovaVeil 不知道具体 IP 时）
+curl -X POST http://localhost:1081/penalize
+# {"penalized":1}
+```
+
+## Docker
+
+```sh
+docker build -t warp-socks5 .
+docker run -d --name warp-socks5 \
+  -p 1080:1080 -p 1081:1081 \
+  -e WARP_POOL_SIZE=8 \
+  warp-socks5
+```
+
+无需 `--privileged`、`--cap-add`、`--device`。
+
+## NovaVeil 集成
+
+### 1. docker-compose 加 warp-socks5 sidecar
+
+```yaml
+networks:
+  internal:
+    driver: bridge
+
+services:
+  novaveil:
+    # ... 现有配置不动 ...
+    networks:
+      - internal
+
+  warp-socks5:
+    build: ./warp-socks5
+    container_name: warp-socks5
+    restart: unless-stopped
+    environment:
+      WARP_POOL_SIZE: "8"
+      WARP_STACK: "ipv6"
+      # WARP_SOURCE_IPV6: "2001:db8::/64"  # 有 /64 前缀才填
+    networks:
+      - internal
+    # 无需 cap_add / devices / privileged
+```
+
+### 2. NovaVeil 渠道配置
+
+在 NovaVeil 控制台把 OpenCode 免费档渠道的代理设为：
+
+```
+socks5://warp-socks5:1080
+```
+
+### 3. 403/429 反应式轮换（可选增强）
+
+NovaVeil 收到上游 403/429 时，向 warp-socks5 控制 API 回报，触发该出口淘汰换新。
+在 NovaVeil 的 403/429 处理逻辑中加一个 HTTP 调用：
+
+```go
+// 伪代码：NovaVeil 收到 429 后
+go http.Post("http://warp-socks5:1081/penalize", "", nil)
+```
+
+不加这步也能工作：NovaVeil 重试时 SOCKS5 轮询自然走到另一个热隧道（不同 IP）。
+
+## 致谢
+
+`internal/warp` 改编自 [opencode2api](https://github.com/jasonxu114514/opencode2api) 的 `internal/warp` 包，
+后者改编自 [sudogeeker/ai-route](https://github.com/sudogeeker/ai-route)（MIT 许可）。
