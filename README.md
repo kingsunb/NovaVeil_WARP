@@ -77,7 +77,9 @@ docker run -d --name warp-socks5 \
 
 ## NovaVeil 集成
 
-### 1. docker-compose 加 warp-socks5 sidecar
+### 1. docker-compose 加 sidecar
+
+服务名必须叫 `NovaVeil_WARP_socks5`，NovaVeil 靠这个名字匹配渠道代理并自动推导控制 API 地址。
 
 ```yaml
 networks:
@@ -90,9 +92,9 @@ services:
     networks:
       - internal
 
-  warp-socks5:
+  NovaVeil_WARP_socks5:
     build: ./warp-socks5
-    container_name: warp-socks5
+    container_name: NovaVeil_WARP_socks5
     restart: unless-stopped
     environment:
       WARP_POOL_SIZE: "8"
@@ -108,20 +110,21 @@ services:
 在 NovaVeil 控制台把 OpenCode 免费档渠道的代理设为：
 
 ```
-socks5://warp-socks5:1080
+socks5://NovaVeil_WARP_socks5:1080
 ```
 
-### 3. 403/429 反应式轮换（可选增强）
+NovaVeil 检测到代理地址含 `NovaVeil_WARP_socks5` 时，自动在 403/429 后向
+`http://NovaVeil_WARP_socks5:1081/penalize` 发异步 POST，淘汰当前出口 IP 并重试。
 
-NovaVeil 收到上游 403/429 时，向 warp-socks5 控制 API 回报，触发该出口淘汰换新。
-在 NovaVeil 的 403/429 处理逻辑中加一个 HTTP 调用：
+### 3. 工作流程
 
-```go
-// 伪代码：NovaVeil 收到 429 后
-go http.Post("http://warp-socks5:1081/penalize", "", nil)
 ```
-
-不加这步也能工作：NovaVeil 重试时 SOCKS5 轮询自然走到另一个热隧道（不同 IP）。
+NovaVeil 请求 → socks5://NovaVeil_WARP_socks5:1080 → WARP 隧道(IP-A) → 上游
+上游返回 429
+NovaVeil → POST http://NovaVeil_WARP_socks5:1081/penalize  (异步, 不阻塞)
+         → WARP 容器淘汰 IP-A, 后台注册新隧道(IP-B)
+NovaVeil 重试 → socks5://NovaVeil_WARP_socks5:1080 → WARP 隧道(IP-B) → 成功
+```
 
 ## 致谢
 
