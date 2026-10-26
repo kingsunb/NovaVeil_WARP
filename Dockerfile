@@ -7,12 +7,12 @@ WORKDIR /src
 COPY go.mod go.sum* ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /warp-socks5 .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /NovaVeil_WARP .
 
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata && \
     adduser -D -u 10001 warp
-COPY --from=builder /warp-socks5 /usr/local/bin/warp-socks5
+COPY --from=builder /NovaVeil_WARP /usr/local/bin/NovaVeil_WARP
 USER 10001
-EXPOSE 1080 1081
-ENTRYPOINT ["warp-socks5"]
+EXPOSE 1080 1081 8080
+ENTRYPOINT ["NovaVeil_WARP"]

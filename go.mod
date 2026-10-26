@@ -1,4 +1,4 @@
-module warp-socks5
+module NovaVeil_WARP
 
 go 1.24
 

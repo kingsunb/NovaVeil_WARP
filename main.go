@@ -1,5 +1,6 @@
-// warp-socks5: 单容器 Cloudflare WARP SOCKS5 代理, 进程内池化多个 WARP 隧道,
-// 每个隧道一个出口 IP. 控制 API 收到 403/429 回报后淘汰对应隧道并后台注册新的.
+// NovaVeil_WARP: 单容器 Cloudflare WARP 代理, 同时提供 SOCKS5 和 HTTP 正向代理,
+// 进程内池化多个 WARP 隧道, 每个隧道一个出口 IP. 控制 API 收到 403/429 回报后
+// 淘汰对应隧道并后台注册新的.
 //
 // 纯用户态 (WireGuard-go + gVisor netstack), 不需要 TUN/root/NET_ADMIN.
 // 代码改编自 github.com/jasonxu114514/opencode2api (internal/warp), MIT 许可.
@@ -22,13 +23,15 @@ import (
 	"syscall"
 	"time"
 
-	"warp-socks5/internal/socks5"
-	"warp-socks5/internal/warp"
+	"NovaVeil_WARP/internal/httpproxy"
+	"NovaVeil_WARP/internal/socks5"
+	"NovaVeil_WARP/internal/warp"
 )
 
 func main() {
 	var (
 		socksListen   = flag.String("socks", getenv("SOCKS5_LISTEN", ":1080"), "SOCKS5 监听地址")
+		httpListen    = flag.String("http", getenv("HTTP_LISTEN", ":8080"), "HTTP 代理监听地址 (传空字符串禁用)")
 		controlListen = flag.String("control", getenv("CONTROL_LISTEN", ":1081"), "控制 API 监听地址")
 		poolSize      = flag.Int("pool-size", getenvInt("WARP_POOL_SIZE", 4), "WARP 隧道池大小 (1-32)")
 		stack         = flag.String("stack", getenv("WARP_STACK", "ipv6"), "隧道地址族: ipv4/ipv6/dual")
@@ -71,21 +74,30 @@ func main() {
 
 	tracker := newRecentTracker(*recentWindow)
 
+	dial := makeDialFunc(pool, tracker, logger)
+
 	srv := &socks5.Server{
-		Dial:    makeDialFunc(pool, tracker, logger),
+		Dial:    dial,
 		Timeout: 30 * time.Second,
 	}
 
 	go startSOCKS5(ctx, *socksListen, srv, logger)
+	if *httpListen != "" {
+		proxy := &httpproxy.Server{
+			Dial:    httpproxy.DialFunc(dial),
+			Timeout: 30 * time.Second,
+		}
+		go startHTTPProxy(ctx, *httpListen, proxy, logger)
+	}
 	go startControl(ctx, *controlListen, pool, tracker, logger)
 
-	logger.Info("warp-socks5 ready", "socks", *socksListen, "control", *controlListen)
+	logger.Info("NovaVeil_WARP ready", "socks", *socksListen, "http", *httpListen, "control", *controlListen)
 	<-ctx.Done()
 	logger.Info("shutting down")
 }
 
-// makeDialFunc 返回 SOCKS5 使用的拨号函数: 从 WARP 池获取租约, 穿透隧道拨号,
-// 连接关闭时释放租约. 拨号失败立即惩罚该隧道.
+// makeDialFunc 返回 SOCKS5 / HTTP 代理使用的拨号函数: 从 WARP 池获取租约,
+// 穿透隧道拨号, 连接关闭时释放租约. 拨号失败立即惩罚该隧道.
 func makeDialFunc(pool *warp.Pool, tracker *recentTracker, logger *slog.Logger) socks5.DialFunc {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		lease, err := pool.Acquire(ctx)
@@ -155,6 +167,28 @@ func startSOCKS5(ctx context.Context, addr string, srv *socks5.Server, logger *s
 				logger.Debug("socks5 session ended", "err", err)
 			}
 		}()
+	}
+}
+
+// --- HTTP 代理监听 ---
+
+func startHTTPProxy(ctx context.Context, addr string, handler http.Handler, logger *slog.Logger) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		logger.Error("http proxy listen failed", "err", err)
+		os.Exit(1)
+	}
+	srv := &http.Server{
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
+	}()
+	logger.Info("http proxy listening", "addr", addr)
+	if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) && ctx.Err() == nil {
+		logger.Error("http proxy failed", "err", err)
 	}
 }
 
