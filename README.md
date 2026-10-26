@@ -136,6 +136,7 @@ http://NovaVeil_WARP_socks5:8080
 
 NovaVeil 检测到代理地址含 `NovaVeil_WARP_socks5` 时，自动在 403/429 后向
 `http://NovaVeil_WARP_socks5:1081/penalize` 发异步 POST，淘汰当前出口 IP 并重试。
+惩罚会关闭旧出口上已建立的连接（替换隧道就绪后立即断开），强制客户端重新建连并拿到新 IP；否则长连接会继续复用旧出口。
 
 ### 3. 工作流程
 

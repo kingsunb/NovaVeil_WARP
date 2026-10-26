@@ -71,6 +71,36 @@ type exit struct {
 	closed    bool
 	penalized bool
 	closeOnce sync.Once
+	connMu    sync.Mutex
+	conns     map[*exitConn]struct{}
+	connsDone bool
+}
+
+// exitConn tracks one dialed connection so a penalized exit can close its
+// existing tunnels immediately. Without this, a client that keeps a CONNECT
+// tunnel alive would keep retrying through the exhausted egress.
+type exitConn struct {
+	net.Conn
+	exit *exit
+	once sync.Once
+}
+
+func (c *exitConn) Close() error {
+	var err error
+	c.once.Do(func() {
+		c.exit.connMu.Lock()
+		delete(c.exit.conns, c)
+		c.exit.connMu.Unlock()
+		err = c.Conn.Close()
+	})
+	return err
+}
+
+func (c *exitConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return nil
 }
 
 func newExit(ctx context.Context, reg registration) (*exit, error) {
@@ -397,11 +427,42 @@ func (e *exit) release() {
 	}
 }
 
+func (e *exit) trackConn(c *exitConn) bool {
+	e.connMu.Lock()
+	defer e.connMu.Unlock()
+	if e.connsDone {
+		return false
+	}
+	if e.conns == nil {
+		e.conns = make(map[*exitConn]struct{})
+	}
+	e.conns[c] = struct{}{}
+	return true
+}
+
+func (e *exit) closeConns() {
+	e.connMu.Lock()
+	e.connsDone = true
+	conns := make([]*exitConn, 0, len(e.conns))
+	for c := range e.conns {
+		conns = append(conns, c)
+	}
+	e.conns = nil
+	e.connMu.Unlock()
+	for _, c := range conns {
+		_ = c.Close()
+	}
+}
+
 func (e *exit) retire() {
 	e.mu.Lock()
 	e.retired = true
 	closeNow := e.refs == 0 && !e.closed
 	e.mu.Unlock()
+	// Close active tunnels immediately. A penalized exit is usually already
+	// answering 429, and a long-lived CONNECT tunnel would otherwise keep
+	// retrying through the exhausted egress while its replacement sits unused.
+	e.closeConns()
 	if closeNow {
 		e.close()
 	}
@@ -466,6 +527,12 @@ func (e *exit) dialContext(ctx context.Context, network, address string) (net.Co
 	if e.network == nil {
 		return nil, errors.New("WARP network is closed")
 	}
+	e.mu.Lock()
+	retired := e.retired || e.closed
+	e.mu.Unlock()
+	if retired {
+		return nil, errors.New("WARP exit is retired")
+	}
 	network = strings.ToLower(strings.TrimSpace(network))
 	switch network {
 	case "tcp":
@@ -488,7 +555,16 @@ func (e *exit) dialContext(ctx context.Context, network, address string) (net.Co
 	default:
 		return nil, fmt.Errorf("unsupported WARP stack %q", e.stack)
 	}
-	return e.network.DialContext(ctx, network, address)
+	conn, err := e.network.DialContext(ctx, network, address)
+	if err != nil {
+		return nil, err
+	}
+	tracked := &exitConn{Conn: conn, exit: e}
+	if !e.trackConn(tracked) {
+		_ = conn.Close()
+		return nil, errors.New("WARP exit is retired")
+	}
+	return tracked, nil
 }
 
 func (e *exit) dialNetwork() string {
