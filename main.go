@@ -33,8 +33,11 @@ func main() {
 		socksListen   = flag.String("socks", getenv("SOCKS5_LISTEN", ":1080"), "SOCKS5 监听地址")
 		httpListen    = flag.String("http", getenv("HTTP_LISTEN", ":8080"), "HTTP 代理监听地址 (传空字符串禁用)")
 		controlListen = flag.String("control", getenv("CONTROL_LISTEN", ":1081"), "控制 API 监听地址")
-		poolSize      = flag.Int("pool-size", getenvInt("WARP_POOL_SIZE", 4), "WARP 隧道池大小 (1-32)")
+		poolSize      = flag.Int("pool-size", getenvInt("WARP_POOL_SIZE", 4), "WARP 隧道池上限 (1-32)")
+		minPool       = flag.Int("min-pool", getenvInt("WARP_MIN_POOL", warp.DefaultMinSize), "空闲时保活的出口下限 (至少 2)")
 		stack         = flag.String("stack", getenv("WARP_STACK", "ipv6"), "隧道地址族: ipv4/ipv6/dual")
+		noFallback    = flag.Bool("no-ipv4-fallback", getenvBool("WARP_NO_IPV4_FALLBACK", false), "禁止 v6 不可用时降级 v4")
+		healthEvery   = flag.Duration("health-interval", getenvDuration("WARP_HEALTH_INTERVAL", 60*time.Second), "周期巡检间隔, 0 关闭")
 		sourceIPv6    = flag.String("source-ipv6", getenv("WARP_SOURCE_IPV6", ""), "外层 IPv6 源前缀 (/64 或更短), 留空则不绑定")
 		recentWindow  = flag.Duration("recent-window", getenvDuration("WARP_RECENT_WINDOW", 10*time.Second), "控制 API 无参惩罚时回看的时间窗口")
 	)
@@ -60,17 +63,20 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	logger.Info("starting WARP pool", "size", *poolSize, "stack", stackType, "source_ipv6", sourcePrefix)
+	logger.Info("starting WARP pool", "min", *minPool, "size", *poolSize, "stack", stackType, "source_ipv6", sourcePrefix)
 	pool, err := warp.NewWithOptions(ctx, logger, warp.Options{
-		Size:       *poolSize,
-		Stack:      stackType,
-		SourceIPv6: sourcePrefix,
+		Size:                *poolSize,
+		MinSize:             *minPool,
+		Stack:               stackType,
+		DisableIPv4Fallback: *noFallback,
+		SourceIPv6:          sourcePrefix,
 	})
 	if err != nil {
 		logger.Error("WARP pool init failed", "err", err)
 		os.Exit(1)
 	}
 	defer pool.Close()
+	pool.StartHealthCheck(*healthEvery)
 
 	tracker := newRecentTracker(*recentWindow)
 
@@ -212,6 +218,15 @@ func startControl(ctx context.Context, addr string, pool *warp.Pool, tracker *re
 		json.NewEncoder(w).Encode(snap)
 	})
 
+	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
+		status := struct {
+			warp.Snapshot
+			CoolingUntil map[string]time.Time `json:"CoolingUntil"`
+		}{Snapshot: pool.Snapshot(), CoolingUntil: pool.CoolingUntil()}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(status)
+	})
+
 	mux.HandleFunc("POST /penalize", func(w http.ResponseWriter, r *http.Request) {
 		egress := strings.TrimSpace(r.URL.Query().Get("egress"))
 		reason := strings.TrimSpace(r.URL.Query().Get("reason"))
@@ -232,6 +247,47 @@ func startControl(ctx context.Context, addr string, pool *warp.Pool, tracker *re
 		logger.Info("penalize request", "egress", egress, "penalized", penalized)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]int{"penalized": penalized})
+	})
+
+	mux.HandleFunc("POST /rotate", func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		egress := strings.TrimSpace(query.Get("egress"))
+		reason := strings.TrimSpace(query.Get("reason"))
+		if reason == "" {
+			reason = "control-api"
+		}
+		rotated := 0
+		switch {
+		case query.Get("all") != "":
+			rotated = pool.RotateAll(reason)
+		case egress != "":
+			if pool.PenalizeByEgress(egress, reason) {
+				rotated = 1
+			}
+		default:
+			rotated = pool.PenalizeRecent(tracker.Recent(), reason)
+		}
+		logger.Info("rotate request", "egress", egress, "rotated", rotated)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]int{"rotated": rotated})
+	})
+
+	mux.HandleFunc("POST /probe", func(w http.ResponseWriter, r *http.Request) {
+		egress := strings.TrimSpace(r.URL.Query().Get("egress"))
+		probeCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
+		defer cancel()
+		dropped := 0
+		if egress != "" {
+			healthy, found := pool.ProbeEgress(probeCtx, egress)
+			if found && !healthy {
+				dropped = 1
+			}
+		} else {
+			dropped = pool.Check(probeCtx)
+		}
+		logger.Info("probe request", "egress", egress, "dropped", dropped)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]int{"dropped": dropped})
 	})
 
 	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
@@ -312,6 +368,17 @@ func getenvDuration(key string, def time.Duration) time.Duration {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
 		}
+	}
+	return def
+}
+
+func getenvBool(key string, def bool) bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch v {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
 	}
 	return def
 }

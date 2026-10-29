@@ -65,6 +65,7 @@ type exit struct {
 	stack     Stack
 	device    *device.Device
 	network   *netstack.Net
+	verify    func(context.Context) (netip.Addr, error)
 	mu        sync.Mutex
 	refs      int
 	retired   bool
@@ -194,7 +195,25 @@ func newExitWithStack(ctx context.Context, reg registration, stack Stack, source
 		return nil, err
 	}
 	e.egress = egress
+	e.verify = func(ctx context.Context) (netip.Addr, error) {
+		return e.probe(ctx, wg, peerKey, endpoints)
+	}
 	return e, nil
+}
+
+// verifyEgress 重探该出口的公网地址, 供周期巡检使用.
+func (e *exit) verifyEgress(ctx context.Context) (netip.Addr, error) {
+	e.mu.Lock()
+	verify := e.verify
+	retired := e.retired || e.closed
+	e.mu.Unlock()
+	if retired {
+		return netip.Addr{}, errors.New("WARP exit is retired")
+	}
+	if verify == nil {
+		return netip.Addr{}, errors.New("WARP exit has no verifier")
+	}
+	return verify(ctx)
 }
 
 // preferIPv6Endpoints returns endpoints with the IPv6 ones first and the IPv4

@@ -14,10 +14,25 @@ import (
 
 const DefaultPoolSize = 2
 
-// egressCooldown keeps a public /64 (or IPv4 /32) that the upstream has
-// rejected out of the pool for this long. The free tier scopes its quota to
-// that block, so a new tunnel inside it would only repeat the same answer.
-const egressCooldown = 30 * time.Minute
+// DefaultMinSize 是默认池底: 1 个在岗 + 2 个备用.
+const DefaultMinSize = 3
+
+// maxEgressCooldown 是耗尽段冷却的封顶, 防止池子长时间填不满.
+const maxEgressCooldown = 6 * time.Hour
+
+// ipv4FallbackBudget 是 v6 失败后改用 v4 重建的时间预算.
+const ipv4FallbackBudget = 60 * time.Second
+
+// egressCooldownUntil 返回耗尽段的解锁时刻.
+// 免费额度按 UTC 0 点重置, 冷却必须对齐重置点.
+func egressCooldownUntil(now time.Time) time.Time {
+	utc := now.UTC()
+	reset := time.Date(utc.Year(), utc.Month(), utc.Day()+1, 0, 0, 0, 0, time.UTC)
+	if reset.Sub(now) > maxEgressCooldown {
+		return now.Add(maxEgressCooldown)
+	}
+	return reset
+}
 
 // refillRetryDelay spaces out a failed registration attempt. A successful
 // attempt is only limited by the registrar's own 12-second pacing.
@@ -73,6 +88,7 @@ type Pool struct {
 	cancel  context.CancelFunc
 	logger  logger
 	size    int
+	minSize int
 	stack   Stack
 	newExit func(context.Context) (*exit, error)
 
@@ -101,13 +117,17 @@ type Lease struct {
 type Snapshot struct {
 	Stack string
 	Size  int
+	// MinSize 是空闲时也要保活的出口下限.
+	MinSize int
 	// Active is the number of exits currently in the ring. Standby counts the
 	// idle part of it: exits not held by a lease and ready to replace a
 	// penalized one immediately.
 	Active  int
 	Standby int
 	Cooling int
-	Egress  []string
+	// Fallback 统计实际走 v4 的出口数, 非零说明 v6 不可用.
+	Fallback int
+	Egress   []string
 }
 
 // Options configure a WARP pool.
@@ -116,9 +136,14 @@ type Options struct {
 	// the current concurrency needs (leases in flight plus queued requests,
 	// plus a spare) and never exceeds Size.
 	Size int
+	// MinSize 是空闲时也保活的出口下限, 小于 2 时按 2 处理.
+	MinSize int
 	// Stack selects the address family inside the tunnel. An IPv6 stack makes
 	// the public egress an IPv6 address.
 	Stack Stack
+	// DisableIPv4Fallback 关闭 v6 建立失败后的 v4 兜底.
+	// 零值即启用兜底, 避免调用方漏传导致静默关闭.
+	DisableIPv4Fallback bool
 	// SourceIPv6, when valid, is the outer IPv6 prefix each exit binds its
 	// WireGuard socket to. Every exit draws its own address from it, so a
 	// replacement reaches Cloudflare from a new source and receives a new
@@ -141,7 +166,7 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 		size = DefaultPoolSize
 	}
 	r := newRegistrar()
-	pool, err := newPool(ctx, slogLogger{log: log}, size, func(ctx context.Context) (*exit, error) {
+	pool, err := newPool(ctx, slogLogger{log: log}, size, opts.MinSize, func(ctx context.Context) (*exit, error) {
 		reg, err := r.register(ctx)
 		if err != nil {
 			return nil, err
@@ -153,7 +178,17 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 				return nil, err
 			}
 		}
-		return newExitWithStack(ctx, reg, normalized, source)
+		candidate, err := newExitWithStack(ctx, reg, normalized, source)
+		if err == nil || normalized != StackIPv6 || opts.DisableIPv4Fallback {
+			return candidate, err
+		}
+		fallbackCtx, cancel := context.WithTimeout(ctx, ipv4FallbackBudget)
+		defer cancel()
+		if log != nil {
+			log.Warn("WARP IPv6 exit unavailable, falling back to IPv4", "err", err)
+		}
+		// 同一份注册同时含 v4/v6 地址, 兜底无需重新注册.
+		return newExitWithStack(fallbackCtx, reg, StackIPv4, netip.Addr{})
 	})
 	if err != nil {
 		return nil, err
@@ -185,9 +220,18 @@ func randomSource(prefix netip.Prefix) (netip.Addr, error) {
 	return netip.AddrFrom16(address), nil
 }
 
-func newPool(ctx context.Context, log logger, size int, create func(context.Context) (*exit, error)) (*Pool, error) {
+func newPool(ctx context.Context, log logger, size int, minSize int, create func(context.Context) (*exit, error)) (*Pool, error) {
 	if size <= 0 {
 		size = DefaultPoolSize
+	}
+	if minSize <= 0 {
+		minSize = DefaultMinSize
+	}
+	if minSize < 2 {
+		minSize = 2
+	}
+	if minSize > size {
+		minSize = size
 	}
 	// The caller's context bounds the synchronous first registration, not the
 	// pool: it is typically an initialization deadline that expires moments
@@ -200,6 +244,7 @@ func newPool(ctx context.Context, log logger, size int, create func(context.Cont
 		cancel:   cancel,
 		logger:   log,
 		size:     size,
+		minSize:  minSize,
 		newExit:  create,
 		reserved: make(map[string]bool),
 		cooling:  make(map[string]time.Time),
@@ -212,7 +257,7 @@ func newPool(ctx context.Context, log logger, size int, create func(context.Cont
 	}
 	p.active = []*exit{first}
 	if log != nil {
-		log.Infof("OpenCode WARP/%s pool ready (max %d exits, one spare)", first.stack, size)
+		log.Infof("OpenCode WARP/%s pool ready (min %d, max %d exits)", first.stack, minSize, size)
 	}
 	p.startRefill()
 	return p, nil
@@ -220,12 +265,14 @@ func newPool(ctx context.Context, log logger, size int, create func(context.Cont
 
 // desiredLocked is the number of exits the pool should keep hot: one per
 // in-flight lease, one for every request waiting for an exit, plus a spare, so
-// a 429 can switch to a ready exit instead of waiting for a registration. Size
-// is the upper bound; at idle a pool of two or more keeps one spare.
+// a 429 can switch to a ready exit instead of waiting for a registration.
+// MinSize is the idle floor: it keeps standby buckets warm even with no
+// traffic, which is what turns the pool into a rolling stock instead of an
+// on-demand refill. Size is the upper bound.
 func (p *Pool) desiredLocked() int {
 	want := p.inflight + p.waiting + 1
-	if want < 2 {
-		want = 2
+	if want < p.minSize {
+		want = p.minSize
 	}
 	if want > p.size {
 		want = p.size
@@ -347,16 +394,116 @@ func (p *Pool) PenalizeRecent(keys []string, reason string) int {
 func (p *Pool) Snapshot() Snapshot {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	snapshot := Snapshot{Stack: string(p.stack), Size: p.size, Active: len(p.active), Cooling: len(p.cooling)}
+	snapshot := Snapshot{Stack: string(p.stack), Size: p.size, MinSize: p.minSize, Active: len(p.active), Cooling: len(p.cooling)}
 	for _, active := range p.active {
 		if active.idle() {
 			snapshot.Standby++
+		}
+		if active.stack != p.stack {
+			snapshot.Fallback++
 		}
 		if active.egress.IsValid() {
 			snapshot.Egress = append(snapshot.Egress, active.egress.String())
 		}
 	}
 	return snapshot
+}
+
+// CoolingUntil 返回冷却中的出口段及其解锁时刻.
+func (p *Pool) CoolingUntil() map[string]time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	cooling := make(map[string]time.Time, len(p.cooling))
+	for key, until := range p.cooling {
+		cooling[key] = until
+	}
+	return cooling
+}
+
+// StartHealthCheck 启动周期巡检, interval 小于等于 0 时不启动.
+func (p *Pool) StartHealthCheck(interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	p.wait.Add(1)
+	go func() {
+		defer p.wait.Done()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-ticker.C:
+				p.Check(p.ctx)
+			}
+		}
+	}()
+}
+
+// Check 巡检全部空闲出口, 返回淘汰数量.
+// 只探空闲出口, 避免打断正在传输的连接.
+func (p *Pool) Check(ctx context.Context) int {
+	p.mu.Lock()
+	candidates := make([]*exit, 0, len(p.active))
+	for _, active := range p.active {
+		if active.idle() {
+			candidates = append(candidates, active)
+		}
+	}
+	p.mu.Unlock()
+	dropped := 0
+	for _, candidate := range candidates {
+		egress, err := candidate.verifyEgress(ctx)
+		if err == nil && egress == candidate.egress {
+			continue
+		}
+		reason := "health check failed"
+		if err == nil {
+			reason = "egress drifted"
+		}
+		p.penalize(candidate, reason)
+		dropped++
+	}
+	return dropped
+}
+
+// ProbeEgress 巡检指定出口, 返回健康状态与是否找到该出口.
+// 探测失败或出口发生漂移时立即淘汰.
+func (p *Pool) ProbeEgress(ctx context.Context, addr string) (bool, bool) {
+	p.mu.Lock()
+	var target *exit
+	for _, active := range p.active {
+		if active.egress.IsValid() && active.egress.String() == addr {
+			target = active
+			break
+		}
+	}
+	p.mu.Unlock()
+	if target == nil {
+		return false, false
+	}
+	egress, err := target.verifyEgress(ctx)
+	if err != nil {
+		p.penalize(target, "probe failed")
+		return false, true
+	}
+	if egress != target.egress {
+		p.penalize(target, "egress drifted")
+		return false, true
+	}
+	return true, true
+}
+
+// RotateAll 淘汰全部在岗出口, 返回淘汰数量.
+func (p *Pool) RotateAll(reason string) int {
+	p.mu.Lock()
+	targets := append([]*exit(nil), p.active...)
+	p.mu.Unlock()
+	for _, target := range targets {
+		p.penalize(target, reason)
+	}
+	return len(targets)
 }
 
 func (p *Pool) penalize(bad *exit, reason string) {
@@ -375,7 +522,7 @@ func (p *Pool) penalize(bad *exit, reason string) {
 		return
 	}
 	if key := bad.egressKey(); key != "" {
-		p.cooling[key] = time.Now().Add(egressCooldown)
+		p.cooling[key] = egressCooldownUntil(time.Now())
 		delete(p.reserved, key)
 	}
 	p.active = append(p.active[:index], p.active[index+1:]...)
