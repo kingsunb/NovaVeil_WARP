@@ -2,7 +2,8 @@
 
 NovaVeil_WARP 是单容器 Cloudflare WARP 代理，同时提供 SOCKS5（默认 `:1080`）和 HTTP 代理（默认 `:8080`）。
 进程内池化多个 WARP 隧道，每个隧道一个出口 IP。
-控制 API 收到 403/429 回报后淘汰对应隧道并后台注册新的，实现单容器无限换 IP。
+控制 API 收到 429 回报后淘汰对应隧道并后台轮换，403 视为形态/身份信号不换出口。
+同时提供稳定的槽位账号，把并发请求固定到不同出口。
 
 纯用户态（WireGuard-go + gVisor netstack），**不需要 TUN 设备、root、NET_ADMIN**。
 
@@ -14,7 +15,8 @@ NovaVeil_WARP 是单容器 Cloudflare WARP 代理，同时提供 SOCKS5（默认
        → 每个 SOCKS5 / HTTP 代理连接轮询取一个
        → HTTP 代理支持 CONNECT（HTTPS 隧道）和 absolute-URI（纯 HTTP 转发）
        → 每 60 秒巡检空闲隧道，探不通即淘汰补位
-       → 控制 API 报 403/429 → 淘汰该隧道 → 后台注册新隧道替换
+       → 控制 API 报 429 → 轮换该隧道 → 后台注册新隧道替换
+       → 槽位账号 warp-0..warp-N-1 固定到各自出口
        → 用户永远拿到热隧道，不等注册
 ```
 
@@ -53,6 +55,24 @@ curl -x http://127.0.0.1:8080 http://example.com
 curl -x http://127.0.0.1:8080 https://api.ipify.org
 ```
 
+### 槽位账号
+
+`GET /slots` 返回 `slot 0..size-1` 的稳定槽位表，每格绑定一个在岗出口。
+槽位被惩罚或轮换时会先绑定新出口再释放旧出口，`generation` 随之加一。
+HTTP 代理从 `Proxy-Authorization: Basic` 的用户名读取槽位，SOCKS5 走 RFC1929；
+密码忽略，未带 `warp-` 前缀的用户名继续使用原来的轮询行为。
+
+```sh
+# HTTP CONNECT：用户名 warp-0，密码任意
+curl -x http://warp-0:any@127.0.0.1:8080 https://api.ipify.org
+
+# SOCKS5：同样用 warp-<slot> 作为用户名
+curl -x socks5h://warp-0:any@127.0.0.1:1080 https://api.ipify.org
+```
+
+未知槽位返回 407，忙/冷却/无出口返回 503 与 `Retry-After`，不会静默换到别的出口。
+槽位认证只用于选路，不构成安全边界；监听地址仍应只绑 `127.0.0.1`。
+
 ### 参数
 
 | 参数 | 环境变量 | 默认 | 说明 |
@@ -78,13 +98,17 @@ curl http://localhost:1081/snapshot
 # 详细状态：多一份冷却名单与解锁时刻
 curl http://localhost:1081/status
 
+# 槽位表：每个 slot 的出口、/64 或 /32 前缀、状态、在途数与 generation
+curl http://localhost:1081/slots
+# {"size":4,"updated_at":"...","slots":[{"slot":0,"account":"warp-0",...}]}
+
 # 健康检查
 curl http://localhost:1081/healthz
 
 # 惩罚特定出口（NovaVeil 知道 egress IP 时）
 curl -X POST 'http://localhost:1081/penalize?egress=2606:4700:...&reason=429'
 
-# 惩罚最近用过的出口（NovaVeil 不知道具体 IP 时）
+# 惩罚最近一次拨号的单个出口（NovaVeil 不知道具体 IP 时）
 curl -X POST http://localhost:1081/penalize
 # {"penalized":1}
 
@@ -99,6 +123,13 @@ curl -X POST http://localhost:1081/probe
 
 被淘汰的出口段进入冷却，解锁时刻对齐到下一个 UTC 0 点（免费额度重置点），封顶 6 小时。冷却期间重新抽到同一段会被丢弃重抽。
 
+### 轮换策略
+
+429 触发轮换，403 不触发（形态/身份信号，换出口无益）。
+轮换先复用旧注册、换外层源地址做 soft restart；新出口的 /64（IPv4 为 /32）与旧出口相同才做 full re-key。
+全池轮换串行执行，相邻两次至少间隔 4 秒；单出口 key 每小时最多 2 次，全池 full re-key 每小时最多 60 次。
+连续失败按 `300 * 2^n` 秒退避，封顶 3600 秒；预算耗尽或退避期间恢复旧出口，不会无限重试。
+
 ## Docker
 
 ```sh
@@ -112,7 +143,7 @@ docker run -d --name NovaVeil_WARP_socks5 \
 
 容器/服务名默认用 `NovaVeil_WARP_socks5`；镜像仓库名用小写 `novaveil_warp`（Docker 要求）。
 
-端口务必只绑 `127.0.0.1`：SOCKS5 与 HTTP 代理都是**无认证**的，绑 `0.0.0.0` 等于在公网开一个开放代理，会被扫段打爆。远程机器用 SSH 隧道接入：
+端口务必只绑 `127.0.0.1`：SOCKS5 与 HTTP 代理默认无认证，槽位用户名只用于选路；绑 `0.0.0.0` 等于在公网开一个开放代理，会被扫段打爆。远程机器用 SSH 隧道接入：
 
 ```sh
 ssh -N -L 1080:127.0.0.1:1080 -L 1081:127.0.0.1:1081 user@vps
@@ -166,8 +197,8 @@ socks5://NovaVeil_WARP_socks5:1080
 http://NovaVeil_WARP_socks5:8080
 ```
 
-NovaVeil 检测到代理地址含 `NovaVeil_WARP_socks5` 时，自动在 403/429 后向
-`http://NovaVeil_WARP_socks5:1081/penalize` 发异步 POST，淘汰当前出口 IP 并重试。
+NovaVeil 检测到代理地址含 `NovaVeil_WARP_socks5` 时，自动在 429 后向
+`http://NovaVeil_WARP_socks5:1081/penalize` 发异步 POST，淘汰最近一次拨号的出口（单次最多 1 个）并重试。
 惩罚会关闭旧出口上已建立的连接（替换隧道就绪后立即断开），强制客户端重新建连并拿到新 IP；否则长连接会继续复用旧出口。
 
 ### 3. 工作流程

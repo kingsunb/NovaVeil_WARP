@@ -5,17 +5,20 @@ package httpproxy
 
 import (
 	"context"
+	"encoding/base64"
+	"errors"
 	"io"
+	"math"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// DialFunc 拨号到目标地址. 调用方在这里获取 WARP 租约并穿透隧道,
-// 返回的 net.Conn 关闭时应当释放租约.
-type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+// DialFunc 拨号到目标地址, username 为槽位账号.
+type DialFunc func(ctx context.Context, network, addr, username string) (net.Conn, error)
 
 // Server 是一个 HTTP 代理. Dial 必须设置, 其余字段可选.
 type Server struct {
@@ -60,9 +63,9 @@ func (s *Server) serveConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstream, err := s.dial(r.Context(), "tcp", target)
+	upstream, err := s.dial(r.Context(), "tcp", target, proxyUsername(r))
 	if err != nil {
-		http.Error(w, "upstream dial failed", http.StatusBadGateway)
+		writeDialError(w, err)
 		return
 	}
 	defer upstream.Close()
@@ -111,14 +114,14 @@ func (s *Server) serveForward(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	out := r.Clone(r.Context())
+	out := r.Clone(withProxyUsername(r.Context(), proxyUsername(r)))
 	out.RequestURI = ""
 	out.Close = false
 	removeHopByHop(out.Header)
 
 	resp, err := s.roundTripper().RoundTrip(out)
 	if err != nil {
-		http.Error(w, "upstream request failed", http.StatusBadGateway)
+		writeDialError(w, err)
 		return
 	}
 	defer resp.Body.Close()
@@ -137,8 +140,10 @@ func (s *Server) serveForward(w http.ResponseWriter, r *http.Request) {
 func (s *Server) roundTripper() http.RoundTripper {
 	s.once.Do(func() {
 		s.transport = &http.Transport{
-			Proxy:               nil,
-			DialContext:         s.dial,
+			Proxy: nil,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return s.dial(ctx, network, addr, proxyUsernameFromContext(ctx))
+			},
 			DisableCompression:  true,
 			DisableKeepAlives:   true,
 			TLSHandshakeTimeout: 15 * time.Second,
@@ -205,10 +210,62 @@ func relay(client, upstream net.Conn, bufferSize int) {
 	<-done
 }
 
-func (s *Server) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+func (s *Server) dial(ctx context.Context, network, addr, username string) (net.Conn, error) {
 	dialCtx, cancel := context.WithTimeout(ctx, s.dialTimeout())
 	defer cancel()
-	return s.Dial(dialCtx, network, addr)
+	return s.Dial(dialCtx, network, addr, username)
+}
+
+func proxyUsername(r *http.Request) string {
+	header := strings.TrimSpace(r.Header.Get("Proxy-Authorization"))
+	const prefix = "basic "
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return ""
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(header[len(prefix):]))
+	if err != nil {
+		return ""
+	}
+	username, _, _ := strings.Cut(string(raw), ":")
+	return username
+}
+
+type usernameContextKey struct{}
+
+func withProxyUsername(ctx context.Context, username string) context.Context {
+	return context.WithValue(ctx, usernameContextKey{}, username)
+}
+
+func proxyUsernameFromContext(ctx context.Context) string {
+	username, _ := ctx.Value(usernameContextKey{}).(string)
+	return username
+}
+
+type proxyStatusError interface {
+	ProxyStatus() (int, time.Duration)
+}
+
+func writeDialError(w http.ResponseWriter, err error) {
+	status := http.StatusBadGateway
+	var retry time.Duration
+	var statusErr proxyStatusError
+	if errors.As(err, &statusErr) {
+		status, retry = statusErr.ProxyStatus()
+	}
+	if status < 100 || status > 599 {
+		status = http.StatusBadGateway
+	}
+	if status == http.StatusProxyAuthRequired {
+		w.Header().Set("Proxy-Authenticate", `Basic realm="warp-slots"`)
+	}
+	if retry > 0 {
+		seconds := int(math.Ceil(retry.Seconds()))
+		if seconds < 1 {
+			seconds = 1
+		}
+		w.Header().Set("Retry-After", strconv.Itoa(seconds))
+	}
+	http.Error(w, http.StatusText(status), status)
 }
 
 func (s *Server) bufferSize() int {

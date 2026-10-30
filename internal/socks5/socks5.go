@@ -1,4 +1,4 @@
-// Package socks5 实现一个最小 SOCKS5 服务端, 只支持无认证 + CONNECT.
+// Package socks5 实现最小 SOCKS5 服务端, 支持 RFC1929 认证.
 // 不依赖外部库, 协议见 RFC 1928. 每个连接用调用方传入的 DialFunc 拨号,
 // 连接关闭时由 DialFunc 返回的 net.Conn 的 Close 负责释放底层资源.
 package socks5
@@ -14,9 +14,8 @@ import (
 	"time"
 )
 
-// DialFunc 拨号到目标地址. 调用方在此获取 WARP 租约并穿透隧道,
-// 返回的 net.Conn 关闭时应当释放租约.
-type DialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+// DialFunc 拨号到目标地址, username 为槽位账号.
+type DialFunc func(ctx context.Context, network, addr, username string) (net.Conn, error)
 
 // Server 是一个 SOCKS5 服务端.
 type Server struct {
@@ -34,7 +33,8 @@ func (s *Server) Serve(ctx context.Context, client net.Conn) error {
 	}
 
 	// 1. 握手: VER NMETHODS METHODS
-	if err := s.negotiate(client); err != nil {
+	username, err := s.negotiate(client)
+	if err != nil {
 		return fmt.Errorf("socks5 negotiate: %w", err)
 	}
 
@@ -49,9 +49,9 @@ func (s *Server) Serve(ctx context.Context, client net.Conn) error {
 	// 3. 拨号
 	dialCtx, cancel := context.WithTimeout(ctx, s.dialTimeout())
 	defer cancel()
-	upstream, err := s.Dial(dialCtx, "tcp", addr)
+	upstream, err := s.Dial(dialCtx, "tcp", addr, username)
 	if err != nil {
-		s.sendReply(client, 0x05) // Connection refused
+		s.sendReply(client, socksReply(err))
 		return fmt.Errorf("socks5 dial %s: %w", addr, err)
 	}
 	defer upstream.Close()
@@ -66,25 +66,74 @@ func (s *Server) Serve(ctx context.Context, client net.Conn) error {
 	return nil
 }
 
-func (s *Server) negotiate(client net.Conn) error {
+func (s *Server) negotiate(client net.Conn) (string, error) {
 	header := make([]byte, 2)
 	if _, err := io.ReadFull(client, header); err != nil {
-		return err
+		return "", err
 	}
 	if header[0] != 0x05 {
-		return errors.New("unsupported SOCKS version")
+		return "", errors.New("unsupported SOCKS version")
 	}
 	nmethods := int(header[1])
 	if nmethods == 0 {
-		return errors.New("no auth methods offered")
+		return "", errors.New("no auth methods offered")
 	}
 	methods := make([]byte, nmethods)
 	if _, err := io.ReadFull(client, methods); err != nil {
-		return err
+		return "", err
 	}
-	// 选无认证 (0x00)
-	_, err := client.Write([]byte{0x05, 0x00})
-	return err
+	method := byte(0xFF)
+	hasNoAuth := false
+	for _, offered := range methods {
+		if offered == 0x02 {
+			method = 0x02
+			break
+		}
+		if offered == 0x00 {
+			hasNoAuth = true
+		}
+	}
+	if method == 0xFF {
+		if !hasNoAuth {
+			_, _ = client.Write([]byte{0x05, 0xFF})
+			return "", errors.New("no acceptable auth methods")
+		}
+		method = 0x00
+	}
+	if _, err := client.Write([]byte{0x05, method}); err != nil {
+		return "", err
+	}
+	if method == 0x02 {
+		return s.readUserPass(client)
+	}
+	return "", nil
+}
+
+func (s *Server) readUserPass(client net.Conn) (string, error) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(client, header); err != nil {
+		return "", err
+	}
+	if header[0] != 0x01 {
+		_, _ = client.Write([]byte{0x01, 0x01})
+		return "", errors.New("unsupported username/password auth version")
+	}
+	username := make([]byte, int(header[1]))
+	if _, err := io.ReadFull(client, username); err != nil {
+		return "", err
+	}
+	length := make([]byte, 1)
+	if _, err := io.ReadFull(client, length); err != nil {
+		return "", err
+	}
+	password := make([]byte, int(length[0]))
+	if _, err := io.ReadFull(client, password); err != nil {
+		return "", err
+	}
+	if _, err := client.Write([]byte{0x01, 0x00}); err != nil {
+		return "", err
+	}
+	return string(username), nil
 }
 
 func (s *Server) readRequest(client net.Conn) (string, error) {
@@ -141,6 +190,18 @@ func (s *Server) sendReply(client net.Conn, rep byte) error {
 	reply := []byte{0x05, rep, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
 	_, err := client.Write(reply)
 	return err
+}
+
+type replyError interface {
+	Socks5Reply() byte
+}
+
+func socksReply(err error) byte {
+	var reply replyError
+	if errors.As(err, &reply) {
+		return reply.Socks5Reply()
+	}
+	return 0x05
 }
 
 type closeWriter interface {

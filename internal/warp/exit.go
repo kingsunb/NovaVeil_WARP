@@ -63,6 +63,8 @@ type exit struct {
 	id        string
 	egress    netip.Addr
 	stack     Stack
+	reg       registration
+	source    netip.Addr
 	device    *device.Device
 	network   *netstack.Net
 	verify    func(context.Context) (netip.Addr, error)
@@ -188,7 +190,7 @@ func newExitWithStack(ctx context.Context, reg registration, stack Stack, source
 		<-wg.Wait()
 		return nil, fmt.Errorf("start WARP device: %w", err)
 	}
-	e := &exit{id: reg.ID, stack: stack, device: wg, network: network}
+	e := &exit{id: reg.ID, stack: stack, device: wg, network: network, reg: reg, source: source}
 	egress, err := e.probe(ctx, wg, peerKey, endpoints)
 	if err != nil {
 		e.close()
@@ -505,12 +507,9 @@ func (e *exit) observe(status int, body []byte) (bool, string) {
 	if e.penalized {
 		return false, ""
 	}
+	// 403 是形态或身份信号, 换出口无益.
 	if status == http.StatusForbidden {
-		reason := "HTTP 403"
-		if networkAnomaly(body) {
-			reason += " network anomaly"
-		}
-		return true, reason
+		return false, ""
 	}
 	// A free-tier 429 is scoped to the egress address, not to the request, the
 	// key or the session: retrying the same exit repeats it. Replace the exit
@@ -536,10 +535,6 @@ func (e *exit) clearPenalty() {
 	e.mu.Lock()
 	e.penalized = false
 	e.mu.Unlock()
-}
-
-func networkAnomaly(body []byte) bool {
-	return strings.Contains(strings.ToLower(string(body)), "network")
 }
 
 func (e *exit) dialContext(ctx context.Context, network, address string) (net.Conn, error) {
@@ -601,17 +596,30 @@ func (e *exit) dialNetwork() string {
 }
 
 func (e *exit) egressKey() string {
-	if e.egress.Is4() {
-		return netip.PrefixFrom(e.egress, 32).Masked().String()
+	return egressPrefix(e.egress)
+}
+
+// egressPrefix 返回 IPv6 /64 或 IPv4 /32 的配额键.
+func egressPrefix(addr netip.Addr) string {
+	if addr.Is4() {
+		return netip.PrefixFrom(addr, 32).Masked().String()
 	}
-	if !e.egress.Is6() {
+	if !addr.Is6() {
 		return ""
 	}
 	// The free tier treats a Cloudflare /64 as one quota scope: rotating inside
 	// the same /64 yields a new /128 but the same exhausted quota. Keying on
 	// the /64 keeps every active and cooling exit on a distinct scope, so a
 	// replacement is a real rotation rather than a cosmetic address change.
-	return netip.PrefixFrom(e.egress, 64).Masked().String()
+	return netip.PrefixFrom(addr, 64).Masked().String()
+}
+
+// sameEgressPrefix 判断两个出口是否落在同一配额段.
+func sameEgressPrefix(a, b netip.Addr) bool {
+	if !a.IsValid() || !b.IsValid() {
+		return false
+	}
+	return egressPrefix(a) == egressPrefix(b)
 }
 
 // idle reports whether no lease currently holds this exit.
@@ -619,4 +627,11 @@ func (e *exit) idle() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.refs == 0 && !e.retired && !e.closed
+}
+
+// available 表示出口仍可承载流量.
+func (e *exit) available() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return !e.retired && !e.closed && !e.penalized
 }

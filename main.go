@@ -1,6 +1,6 @@
 // NovaVeil_WARP: 单容器 Cloudflare WARP 代理, 同时提供 SOCKS5 和 HTTP 正向代理,
-// 进程内池化多个 WARP 隧道, 每个隧道一个出口 IP. 控制 API 收到 403/429 回报后
-// 淘汰对应隧道并后台注册新的.
+// 进程内池化多个 WARP 隧道, 每个隧道一个出口 IP. 控制 API 收到 429 回报后
+// 淘汰对应隧道并后台轮换; 403 视为形态/身份信号, 不换出口.
 //
 // 纯用户态 (WireGuard-go + gVisor netstack), 不需要 TUN/root/NET_ADMIN.
 // 代码改编自 github.com/jasonxu114514/opencode2api (internal/warp), MIT 许可.
@@ -14,8 +14,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"net/netip"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -105,7 +105,17 @@ func main() {
 // makeDialFunc 返回 SOCKS5 / HTTP 代理使用的拨号函数: 从 WARP 池获取租约,
 // 穿透隧道拨号, 连接关闭时释放租约. 拨号失败立即惩罚该隧道.
 func makeDialFunc(pool *warp.Pool, tracker *recentTracker, logger *slog.Logger) socks5.DialFunc {
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr, username string) (net.Conn, error) {
+		if slot, ok := warp.ParseSlotAccount(username); ok {
+			conn, err := pool.DialSlot(ctx, slot, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if egress := conn.EgressAddr(); egress != "" {
+				tracker.Record(egress)
+			}
+			return conn, nil
+		}
 		lease, err := pool.Acquire(ctx)
 		if err != nil {
 			return nil, err
@@ -218,6 +228,11 @@ func startControl(ctx context.Context, addr string, pool *warp.Pool, tracker *re
 		json.NewEncoder(w).Encode(snap)
 	})
 
+	mux.HandleFunc("GET /slots", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(pool.Slots())
+	})
+
 	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
 		status := struct {
 			warp.Snapshot
@@ -235,16 +250,21 @@ func startControl(ctx context.Context, addr string, pool *warp.Pool, tracker *re
 		}
 
 		var penalized int
+		target := egress
 		if egress != "" {
 			if pool.PenalizeByEgress(egress, reason) {
 				penalized = 1
 			}
 		} else {
-			recent := tracker.Recent()
-			penalized = pool.PenalizeRecent(recent, reason)
+			// 只淘汰最近出口, 避免 429 连坐
+			latest := tracker.Latest()
+			target = latest
+			if latest != "" && pool.PenalizeByEgress(latest, reason) {
+				penalized = 1
+			}
 		}
 
-		logger.Info("penalize request", "egress", egress, "penalized", penalized)
+		logger.Info("penalize request", "egress", egress, "target", target, "penalized", penalized)
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]int{"penalized": penalized})
 	})
@@ -258,7 +278,7 @@ func startControl(ctx context.Context, addr string, pool *warp.Pool, tracker *re
 		}
 		rotated := 0
 		switch {
-		case query.Get("all") != "":
+		case query.Has("all"):
 			rotated = pool.RotateAll(reason)
 		case egress != "":
 			if pool.PenalizeByEgress(egress, reason) {
@@ -342,6 +362,19 @@ func (rt *recentTracker) Recent() []string {
 		}
 	}
 	return result
+}
+
+// Latest 返回窗口内最近一次拨号使用的出口.
+func (rt *recentTracker) Latest() string {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	cutoff := time.Now().Add(-rt.window)
+	for i := len(rt.entries) - 1; i >= 0; i-- {
+		if rt.entries[i].at.After(cutoff) {
+			return rt.entries[i].addr
+		}
+	}
+	return ""
 }
 
 // --- 环境变量辅助 ---

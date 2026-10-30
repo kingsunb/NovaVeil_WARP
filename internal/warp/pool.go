@@ -105,6 +105,16 @@ type Pool struct {
 	scaling   bool
 	wait      sync.WaitGroup
 	createMu  sync.Mutex
+
+	slots        []slot
+	pins         int
+	sourcePrefix netip.Prefix
+
+	rotateMu         sync.Mutex
+	lastRotateStart  time.Time
+	keyRotations     map[string][]time.Time
+	fullRekeys       []time.Time
+	rotationFailures map[string]rotationFailure
 }
 
 type Lease struct {
@@ -194,6 +204,7 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 		return nil, err
 	}
 	pool.stack = normalized
+	pool.sourcePrefix = opts.SourceIPv6
 	return pool, nil
 }
 
@@ -240,15 +251,18 @@ func newPool(ctx context.Context, log logger, size int, minSize int, create func
 	// leaving the pool stuck on its first egress forever.
 	poolCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	p := &Pool{
-		ctx:      poolCtx,
-		cancel:   cancel,
-		logger:   log,
-		size:     size,
-		minSize:  minSize,
-		newExit:  create,
-		reserved: make(map[string]bool),
-		cooling:  make(map[string]time.Time),
-		changed:  make(chan struct{}),
+		ctx:              poolCtx,
+		cancel:           cancel,
+		logger:           log,
+		size:             size,
+		minSize:          minSize,
+		newExit:          create,
+		reserved:         make(map[string]bool),
+		cooling:          make(map[string]time.Time),
+		changed:          make(chan struct{}),
+		slots:            make([]slot, size),
+		keyRotations:     make(map[string][]time.Time),
+		rotationFailures: make(map[string]rotationFailure),
 	}
 	first, err := p.createExit(ctx)
 	if err != nil {
@@ -256,6 +270,7 @@ func newPool(ctx context.Context, log logger, size int, minSize int, create func
 		return nil, err
 	}
 	p.active = []*exit{first}
+	p.bindSlotsLocked()
 	if log != nil {
 		log.Infof("OpenCode WARP/%s pool ready (min %d, max %d exits)", first.stack, minSize, size)
 	}
@@ -263,14 +278,12 @@ func newPool(ctx context.Context, log logger, size int, minSize int, create func
 	return p, nil
 }
 
-// desiredLocked is the number of exits the pool should keep hot: one per
-// in-flight lease, one for every request waiting for an exit, plus a spare, so
-// a 429 can switch to a ready exit instead of waiting for a registration.
-// MinSize is the idle floor: it keeps standby buckets warm even with no
-// traffic, which is what turns the pool into a rolling stock instead of an
-// on-demand refill. Size is the upper bound.
+// 槽位数是池容量下限。
 func (p *Pool) desiredLocked() int {
-	want := p.inflight + p.waiting + 1
+	want := p.inflight + p.waiting + p.pins + 1
+	if want < len(p.slots) {
+		want = len(p.slots)
+	}
 	if want < p.minSize {
 		want = p.minSize
 	}
@@ -447,7 +460,7 @@ func (p *Pool) Check(ctx context.Context) int {
 	p.mu.Lock()
 	candidates := make([]*exit, 0, len(p.active))
 	for _, active := range p.active {
-		if active.idle() {
+		if active.idle() && !p.slotBoundLocked(active) {
 			candidates = append(candidates, active)
 		}
 	}
@@ -529,10 +542,12 @@ func (p *Pool) penalize(bad *exit, reason string) {
 	if p.next >= len(p.active) {
 		p.next = 0
 	}
+	releases := p.bindSlotsLocked()
 	p.notifyLocked()
 	p.wait.Add(1)
 	p.mu.Unlock()
 
+	p.releaseExits(releases)
 	if p.logger != nil {
 		p.logger.Warnf("Rotating OpenCode WARP egress %s (%s)", bad.id, reason)
 	}
@@ -540,68 +555,8 @@ func (p *Pool) penalize(bad *exit, reason string) {
 	// and the retry draws whichever active exit is ready first.
 	go func() {
 		defer p.wait.Done()
-		p.replace(bad, reason)
+		p.rotate(bad, reason)
 	}()
-}
-
-func (p *Pool) replace(old *exit, reason string) {
-	replacement, err := p.createExit(p.ctx)
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		if replacement != nil {
-			p.releaseReservation(replacement)
-			replacement.close()
-		}
-		old.retire()
-		return
-	}
-	if err != nil {
-		restored := len(p.active) == 0
-		if restored {
-			old.clearPenalty()
-			if key := old.egressKey(); key != "" {
-				p.reserved[key] = true
-				delete(p.cooling, key)
-			}
-			p.active = append(p.active, old)
-			p.notifyLocked()
-		}
-		p.mu.Unlock()
-		if !restored {
-			old.retire()
-		}
-		if p.logger != nil {
-			p.logger.Errorf("Cannot replace OpenCode WARP egress %s: %v", old.id, err)
-		}
-		p.startRefill()
-		return
-	}
-	if p.activeIndexLocked(old) >= 0 {
-		p.mu.Unlock()
-		p.releaseReservation(replacement)
-		replacement.close()
-		old.retire()
-		return
-	}
-	placed := false
-	if len(p.active) < p.size {
-		p.active = append(p.active, replacement)
-		placed = true
-	}
-	p.notifyLocked()
-	p.mu.Unlock()
-	if !placed {
-		p.releaseReservation(replacement)
-		replacement.close()
-		old.retire()
-		return
-	}
-	if p.logger != nil {
-		p.logger.Infof("OpenCode WARP egress %s replaced by %s at %s (%s), active=%d", old.id, replacement.id, replacement.egress, reason, len(p.active))
-	}
-	old.retire()
-	p.startRefill()
 }
 
 func (p *Pool) refill() {
@@ -617,16 +572,19 @@ func (p *Pool) refill() {
 	p.mu.Lock()
 	p.refilling = false
 	placed := false
+	var releases []*exit
 	if err == nil && !p.closed && len(p.active) < p.size {
 		p.active = append(p.active, replacement)
 		replacement = nil
 		placed = true
+		releases = p.bindSlotsLocked()
 	}
 	if placed || p.closed {
 		p.notifyLocked()
 	}
 	p.mu.Unlock()
 
+	p.releaseExits(releases)
 	if replacement != nil {
 		p.releaseReservation(replacement)
 		replacement.close()
@@ -699,7 +657,7 @@ func (p *Pool) scaleDown() {
 	if surplus := len(p.active) - want; surplus > 0 {
 		kept := p.active[:0]
 		for _, candidate := range p.active {
-			if surplus > 0 && candidate.idle() {
+			if surplus > 0 && candidate.idle() && !p.slotBoundLocked(candidate) {
 				dropped = append(dropped, candidate)
 				surplus--
 				continue
@@ -819,10 +777,21 @@ func (p *Pool) Close() {
 	p.closed = true
 	active := p.active
 	p.active = nil
+	slotExits := make([]*exit, 0, len(p.slots))
+	for index := range p.slots {
+		if p.slots[index].exit != nil {
+			slotExits = append(slotExits, p.slots[index].exit)
+			p.slots[index].exit = nil
+		}
+	}
+	p.pins = 0
 	p.notifyLocked()
 	p.mu.Unlock()
 
 	p.cancel()
+	for _, item := range slotExits {
+		item.release()
+	}
 	for _, item := range active {
 		p.releaseReservation(item)
 		item.retire()
