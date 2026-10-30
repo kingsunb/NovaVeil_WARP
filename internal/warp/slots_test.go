@@ -1,6 +1,7 @@
 package warp
 
 import (
+	"context"
 	"net/netip"
 	"testing"
 	"time"
@@ -69,13 +70,13 @@ func TestBindSlotsInitialGeneration(t *testing.T) {
 	if p.pins != 1 {
 		t.Fatalf("pins = %d, want 1", p.pins)
 	}
-	if fresh.refs != 1 {
-		t.Fatalf("fresh refs = %d, want 1", fresh.refs)
+	if fresh.refs != 0 || fresh.pins != 1 || !fresh.idle() {
+		t.Fatalf("fresh refs = %d, pins = %d, want user-idle with one pin", fresh.refs, fresh.pins)
 	}
 }
 
 func TestBindSlotsSwapKeepsOldUntilReleased(t *testing.T) {
-	old := &exit{id: "old", egress: netip.MustParseAddr("2001:db8:1::1"), refs: 1, penalized: true}
+	old := &exit{id: "old", egress: netip.MustParseAddr("2001:db8:1::1"), pins: 1, penalized: true}
 	fresh := &exit{id: "fresh", egress: netip.MustParseAddr("2001:db8:2::1")}
 	p := &Pool{
 		size:   1,
@@ -93,20 +94,20 @@ func TestBindSlotsSwapKeepsOldUntilReleased(t *testing.T) {
 	if p.pins != 1 {
 		t.Fatalf("pins = %d, want 1", p.pins)
 	}
-	if old.refs != 1 {
-		t.Fatalf("old refs before release = %d, want 1", old.refs)
+	if old.pins != 1 {
+		t.Fatalf("old pins before release = %d, want 1", old.pins)
 	}
 	p.releaseExits(releases)
-	if old.refs != 0 {
-		t.Fatalf("old refs after release = %d, want 0", old.refs)
+	if old.pins != 0 {
+		t.Fatalf("old pins after release = %d, want 0", old.pins)
 	}
-	if fresh.refs != 1 {
-		t.Fatalf("fresh refs = %d, want 1", fresh.refs)
+	if fresh.refs != 0 || fresh.pins != 1 {
+		t.Fatalf("fresh refs = %d, pins = %d, want 0 and 1", fresh.refs, fresh.pins)
 	}
 }
 
 func TestBindSlotsUnbindReleasesPin(t *testing.T) {
-	old := &exit{id: "old", egress: netip.MustParseAddr("2001:db8:1::1"), refs: 1, penalized: true}
+	old := &exit{id: "old", egress: netip.MustParseAddr("2001:db8:1::1"), pins: 1, penalized: true}
 	p := &Pool{size: 1, slots: []slot{{exit: old, generation: 1}}, pins: 1}
 	releases := p.bindSlotsLocked()
 	if p.slots[0].exit != nil {
@@ -119,8 +120,29 @@ func TestBindSlotsUnbindReleasesPin(t *testing.T) {
 		t.Fatalf("releases = %v, want old", releases)
 	}
 	p.releaseExits(releases)
-	if old.refs != 0 {
-		t.Fatalf("old refs = %d, want 0", old.refs)
+	if old.pins != 0 {
+		t.Fatalf("old pins = %d, want 0", old.pins)
+	}
+}
+
+func TestDialSlotFailureDoesNotPenalize(t *testing.T) {
+	e := &exit{id: "target-error", egress: netip.MustParseAddr("2001:db8:1::1"), pins: 1}
+	p := &Pool{
+		size:    1,
+		active:  []*exit{e},
+		slots:   []slot{{exit: e, generation: 1}},
+		pins:    1,
+		cooling: make(map[string]time.Time),
+	}
+	conn, err := p.DialSlot(context.Background(), 0, "tcp", "203.0.113.1:443")
+	if err == nil || conn != nil {
+		t.Fatal("dial without a network must fail")
+	}
+	if len(p.active) != 1 || p.active[0] != e || e.penalized || len(p.cooling) != 0 {
+		t.Fatal("target dial failure must not penalize the exit")
+	}
+	if e.refs != 0 || e.pins != 1 {
+		t.Fatalf("refs = %d, pins = %d, want 0 and 1", e.refs, e.pins)
 	}
 }
 

@@ -80,13 +80,15 @@ curl -x socks5h://warp-0:any@127.0.0.1:1080 https://api.ipify.org
 | `-socks` | `SOCKS5_LISTEN` | `:1080` | SOCKS5 监听地址 |
 | `-http` | `HTTP_LISTEN` | `:8080` | HTTP 代理监听地址（传空字符串禁用） |
 | `-control` | `CONTROL_LISTEN` | `:1081` | 控制 API 监听地址 |
-| `-pool-size` | `WARP_POOL_SIZE` | `4` | WARP 隧道池上限（1-32） |
-| `-min-pool` | `WARP_MIN_POOL` | `3` | 空闲时保活的出口下限（1 在岗 + 2 备用） |
+| `-pool-size` | `WARP_POOL_SIZE` | `4` | 常驻热隧道与槽位数量（1-32） |
+| `-min-pool` | `WARP_MIN_POOL` | `3` | 补池目标下限（正常等于 `pool-size`） |
 | `-stack` | `WARP_STACK` | `ipv6` | 隧道地址族：ipv4/ipv6/dual |
 | `-no-ipv4-fallback` | `WARP_NO_IPV4_FALLBACK` | `false` | 禁止 v6 建不起来时降级 v4 |
 | `-health-interval` | `WARP_HEALTH_INTERVAL` | `60s` | 周期巡检间隔，`0` 关闭 |
 | `-source-ipv6` | `WARP_SOURCE_IPV6` | 空 | 外层 IPv6 源前缀（/64 或更短） |
 | `-recent-window` | `WARP_RECENT_WINDOW` | `10s` | 无参惩罚回看时间窗口 |
+| `-cooldown` | `WARP_COOLDOWN` | `60s` | 被惩罚的配额段重新可用前的等待时长，负值表示不冷却 |
+| `-mem-limit` | `WARP_MEM_LIMIT` | `300MiB` | 进程内存上限，`0` 表示不限制 |
 
 ### 控制 API
 
@@ -121,14 +123,16 @@ curl -X POST http://localhost:1081/probe
 # {"dropped":0}
 ```
 
-被淘汰的出口段进入冷却，解锁时刻对齐到下一个 UTC 0 点（免费额度重置点），封顶 6 小时。冷却期间重新抽到同一段会被丢弃重抽。
+被淘汰的出口段进入冷却，默认 60 秒后重新可用（`-cooldown` 可调，负值表示不冷却）。冷却期间重新抽到同一段会被丢弃重抽。冷却取短值是刻意的：换段成本远低于让池子空掉的成本，早期实现把段锁到下一个 UTC 0 点（最长 6 小时），一次全池换桶就能把池封死。
 
 ### 轮换策略
 
 429 触发轮换，403 不触发（形态/身份信号，换出口无益）。
+目标站自身的 DNS 失败、连接拒绝等拨号错误不触发轮换，避免误杀健康出口。
 轮换先复用旧注册、换外层源地址做 soft restart；新出口的 /64（IPv4 为 /32）与旧出口相同才做 full re-key。
-全池轮换串行执行，相邻两次至少间隔 4 秒；单出口 key 每小时最多 2 次，全池 full re-key 每小时最多 60 次。
-连续失败按 `300 * 2^n` 秒退避，封顶 3600 秒；预算耗尽或退避期间恢复旧出口，不会无限重试。
+soft restart 落点若仍在被封禁的段上，轮换会自动改走 full re-key 换段重建，不会原地重试。
+全池轮换串行执行，相邻两次至少间隔 4 秒；单出口 key 每小时最多 60 次，全池 full re-key 每小时最多 60 次。
+连续失败按 15 * 2^n 秒退避，封顶 300 秒；轮换失败、退避或预算耗尽时旧出口保持退役与冷却，由后台补池提供替代容量，不会无限重试。
 
 ## Docker
 
@@ -136,12 +140,15 @@ curl -X POST http://localhost:1081/probe
 docker build -t novaveil_warp .
 docker run -d --name NovaVeil_WARP_socks5 \
   -p 127.0.0.1:1080:1080 -p 127.0.0.1:8080:8080 -p 127.0.0.1:1081:1081 \
+  --memory=300m --cpus=1.0 \
   -e WARP_MIN_POOL=3 \
   -e WARP_POOL_SIZE=8 \
   novaveil_warp
 ```
 
 容器/服务名默认用 `NovaVeil_WARP_socks5`；镜像仓库名用小写 `novaveil_warp`（Docker 要求）。
+
+内存默认上限 300MB：进程内 `debug.SetMemoryLimit` 取上限的 80% 让 GC 提前回收，容器 `--memory=300m` 兜底硬约束，两者都要配。
 
 端口务必只绑 `127.0.0.1`：SOCKS5 与 HTTP 代理默认无认证，槽位用户名只用于选路；绑 `0.0.0.0` 等于在公网开一个开放代理，会被扫段打爆。远程机器用 SSH 隧道接入：
 
@@ -172,11 +179,15 @@ services:
     build: ./NovaVeil_WARP  # 指向本仓库目录，按实际路径调整
     container_name: NovaVeil_WARP_socks5
     restart: unless-stopped
+    mem_limit: 300m
+    cpus: "1.0"
     environment:
       WARP_MIN_POOL: "3"
       WARP_POOL_SIZE: "8"
       WARP_STACK: "ipv6"
       WARP_HEALTH_INTERVAL: "60s"
+      WARP_COOLDOWN: "60s"
+      WARP_MEM_LIMIT: "300MiB"
       # WARP_SOURCE_IPV6: "2001:db8::/64"  # 有 /64 前缀才填
     networks:
       - internal

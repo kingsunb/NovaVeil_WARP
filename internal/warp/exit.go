@@ -70,6 +70,7 @@ type exit struct {
 	verify    func(context.Context) (netip.Addr, error)
 	mu        sync.Mutex
 	refs      int
+	pins      int
 	retired   bool
 	closed    bool
 	penalized bool
@@ -436,16 +437,42 @@ func (e *exit) addRef() bool {
 	return true
 }
 
-func (e *exit) release() {
+func (e *exit) addPin() bool {
 	e.mu.Lock()
-	if e.refs > 0 {
+	defer e.mu.Unlock()
+	if e.retired || e.closed {
+		return false
+	}
+	e.pins++
+	return true
+}
+
+func (e *exit) release() {
+	e.releaseReference(false)
+}
+
+func (e *exit) releasePin() {
+	e.releaseReference(true)
+}
+
+func (e *exit) releaseReference(pin bool) {
+	e.mu.Lock()
+	if pin {
+		if e.pins > 0 {
+			e.pins--
+		}
+	} else if e.refs > 0 {
 		e.refs--
 	}
-	closeNow := e.refs == 0 && e.retired && !e.closed
+	closeNow := e.closeReadyLocked()
 	e.mu.Unlock()
 	if closeNow {
 		e.close()
 	}
+}
+
+func (e *exit) closeReadyLocked() bool {
+	return e.refs == 0 && e.pins == 0 && e.retired && !e.closed
 }
 
 func (e *exit) trackConn(c *exitConn) bool {
@@ -478,7 +505,7 @@ func (e *exit) closeConns() {
 func (e *exit) retire() {
 	e.mu.Lock()
 	e.retired = true
-	closeNow := e.refs == 0 && !e.closed
+	closeNow := e.closeReadyLocked()
 	e.mu.Unlock()
 	// Close active tunnels immediately. A penalized exit is usually already
 	// answering 429, and a long-lived CONNECT tunnel would otherwise keep
@@ -529,12 +556,6 @@ func (e *exit) markPenalized() bool {
 	}
 	e.penalized = true
 	return true
-}
-
-func (e *exit) clearPenalty() {
-	e.mu.Lock()
-	e.penalized = false
-	e.mu.Unlock()
 }
 
 func (e *exit) dialContext(ctx context.Context, network, address string) (net.Conn, error) {

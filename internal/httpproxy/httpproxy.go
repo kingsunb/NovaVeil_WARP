@@ -22,12 +22,15 @@ type DialFunc func(ctx context.Context, network, addr, username string) (net.Con
 
 // Server 是一个 HTTP 代理. Dial 必须设置, 其余字段可选.
 type Server struct {
-	Dial       DialFunc
-	Timeout    time.Duration
-	BufferSize int
+	Dial          DialFunc
+	Timeout       time.Duration
+	BufferSize    int
+	MaxConcurrent int
 
 	once      sync.Once
 	transport *http.Transport
+	limitOnce sync.Once
+	limit     chan struct{}
 }
 
 var hopHeaders = []string{
@@ -44,6 +47,17 @@ var hopHeaders = []string{
 
 // ServeHTTP 实现 http.Handler.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.MaxConcurrent > 0 {
+		s.limitOnce.Do(func() {
+			s.limit = make(chan struct{}, s.MaxConcurrent)
+		})
+		select {
+		case s.limit <- struct{}{}:
+			defer func() { <-s.limit }()
+		case <-r.Context().Done():
+			return
+		}
+	}
 	if r.Method == http.MethodConnect {
 		s.serveConnect(w, r)
 		return
@@ -144,9 +158,11 @@ func (s *Server) roundTripper() http.RoundTripper {
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				return s.dial(ctx, network, addr, proxyUsernameFromContext(ctx))
 			},
-			DisableCompression:  true,
-			DisableKeepAlives:   true,
-			TLSHandshakeTimeout: 15 * time.Second,
+			DisableCompression:    true,
+			DisableKeepAlives:     true,
+			ExpectContinueTimeout: 5 * time.Second,
+			ResponseHeaderTimeout: s.dialTimeout(),
+			TLSHandshakeTimeout:   15 * time.Second,
 		}
 	})
 	return s.transport

@@ -8,13 +8,19 @@ import (
 const (
 	rotationGap          = 4 * time.Second
 	rotationWindow       = time.Hour
-	maxRotationsPerKey   = 2
+	maxRotationsPerKey   = 60
 	maxFullRekeysPerHour = 60
-	rotationBackoffBase  = 300 * time.Second
-	rotationBackoffCap   = 3600 * time.Second
+	rotationBackoffBase  = 15 * time.Second
+	rotationBackoffCap   = 300 * time.Second
 )
 
-var errEgressPrefixUnchanged = errors.New("WARP egress prefix unchanged")
+var (
+	errEgressPrefixUnchanged = errors.New("WARP egress prefix unchanged")
+	// errCannotPlaceRotated 表示候选出口无法入池, 需要换段重建.
+	errCannotPlaceRotated = errors.New("cannot place rotated WARP exit")
+	// errCannotPlaceRekeyed 表示换段重建后的出口仍无法入池.
+	errCannotPlaceRekeyed = errors.New("cannot place re-keyed WARP exit")
+)
 
 type rotationFailure struct {
 	count int
@@ -54,6 +60,7 @@ func (p *Pool) rotate(old *exit, reason string) {
 	if old == nil {
 		return
 	}
+	defer p.startRefill()
 	if p.keyRotations == nil {
 		p.keyRotations = make(map[string][]time.Time)
 	}
@@ -61,7 +68,6 @@ func (p *Pool) rotate(old *exit, reason string) {
 		p.rotationFailures = make(map[string]rotationFailure)
 	}
 	if p.ctx.Err() != nil {
-		p.restoreExit(old)
 		return
 	}
 	if wait := rotationGap - time.Since(p.lastRotateStart); wait > 0 {
@@ -69,7 +75,6 @@ func (p *Pool) rotate(old *exit, reason string) {
 		defer timer.Stop()
 		select {
 		case <-p.ctx.Done():
-			p.restoreExit(old)
 			return
 		case <-timer.C:
 		}
@@ -82,13 +87,11 @@ func (p *Pool) rotate(old *exit, reason string) {
 	}
 	p.pruneRotationStateLocked(now)
 	if failure, ok := p.rotationFailures[key]; ok && failure.until.After(now) {
-		p.warnf("WARP rotation for %s backs off until %s, restoring %s", key, failure.until.Format(time.RFC3339), old.egress)
-		p.restoreExit(old)
+		p.warnf("WARP rotation for %s backs off until %s, keeping %s retired", key, failure.until.Format(time.RFC3339), old.egress)
 		return
 	}
 	if len(p.keyRotations[key]) >= maxRotationsPerKey {
-		p.warnf("WARP rotation budget for %s exhausted, restoring %s", key, old.egress)
-		p.restoreExit(old)
+		p.warnf("WARP rotation budget for %s exhausted, keeping %s retired", key, old.egress)
 		return
 	}
 	p.lastRotateStart = now
@@ -102,7 +105,7 @@ func (p *Pool) rotate(old *exit, reason string) {
 			return
 		}
 		candidate.close()
-		err = errors.New("cannot place rotated WARP exit")
+		err = errCannotPlaceRotated
 	} else {
 		if candidate != nil {
 			candidate.close()
@@ -111,10 +114,11 @@ func (p *Pool) rotate(old *exit, reason string) {
 			err = errEgressPrefixUnchanged
 		}
 	}
-	if errors.Is(err, errEgressPrefixUnchanged) {
+	// 放置失败同样走换段重建: soft restart 复用旧注册, 落点常常还在刚被
+	// 惩罚的段上, 只有换段才能真正换掉配额作用域.
+	if errors.Is(err, errEgressPrefixUnchanged) || errors.Is(err, errCannotPlaceRotated) {
 		if !p.takeFullRekeyLocked(now) {
-			p.warnf("WARP full re-key budget exhausted, restoring %s", old.egress)
-			p.restoreExit(old)
+			p.warnf("WARP full re-key budget exhausted, keeping %s retired", old.egress)
 			return
 		}
 		candidate, err = p.createExit(p.ctx)
@@ -126,7 +130,7 @@ func (p *Pool) rotate(old *exit, reason string) {
 			}
 			p.releaseReservation(candidate)
 			candidate.close()
-			err = errors.New("cannot place re-keyed WARP exit")
+			err = errCannotPlaceRekeyed
 		} else {
 			if candidate != nil {
 				p.releaseReservation(candidate)
@@ -139,8 +143,7 @@ func (p *Pool) rotate(old *exit, reason string) {
 	}
 
 	delay := p.recordRotationFailureLocked(key, time.Now())
-	p.warnf("WARP rotation for %s failed (%v), restoring %s, next attempt after %s", key, err, old.egress, delay)
-	p.restoreExit(old)
+	p.warnf("WARP rotation for %s failed (%v), keeping %s retired, next attempt after %s", key, err, old.egress, delay)
 }
 
 func (p *Pool) softRestart(old *exit) (*exit, error) {
@@ -198,6 +201,10 @@ func (p *Pool) placeRotated(old, candidate *exit, reserved bool) bool {
 		evicted.retire()
 	}
 	p.releaseExits(releases)
+	// 旧出口退役后释放它的段占用, 否则该配额段被永久标记为已用.
+	if oldKey := old.egressKey(); oldKey != "" && oldKey != candidate.egressKey() {
+		p.releaseReservation(old)
+	}
 	old.retire()
 	p.startRefill()
 	return true
@@ -255,7 +262,8 @@ func (p *Pool) claimReservedCandidate(candidate *exit) bool {
 
 func (p *Pool) dropIdleLocked(except *exit) *exit {
 	for index, candidate := range p.active {
-		if candidate == except || p.slotBoundLocked(candidate) || !candidate.idle() {
+		// 槽位会在 bindSlotsLocked 里重绑, 因此绑着槽位的空闲出口也能挤掉.
+		if candidate == except || !candidate.idle() {
 			continue
 		}
 		p.active = append(p.active[:index], p.active[index+1:]...)
@@ -265,59 +273,6 @@ func (p *Pool) dropIdleLocked(except *exit) *exit {
 		return candidate
 	}
 	return nil
-}
-
-func (p *Pool) restoreExit(old *exit) {
-	if old == nil {
-		return
-	}
-	p.mu.Lock()
-	if p.closed {
-		p.mu.Unlock()
-		old.retire()
-		return
-	}
-	if p.activeIndexLocked(old) >= 0 {
-		old.clearPenalty()
-		if key := old.egressKey(); key != "" {
-			p.reserved[key] = true
-			delete(p.cooling, key)
-		}
-		releases := p.bindSlotsLocked()
-		p.notifyLocked()
-		p.mu.Unlock()
-		p.releaseExits(releases)
-		p.startRefill()
-		return
-	}
-	var evicted *exit
-	if len(p.active) >= p.size {
-		evicted = p.dropIdleLocked(old)
-	}
-	if len(p.active) >= p.size {
-		if key := old.egressKey(); key != "" {
-			delete(p.cooling, key)
-		}
-		p.mu.Unlock()
-		old.retire()
-		return
-	}
-	old.clearPenalty()
-	if key := old.egressKey(); key != "" {
-		p.reserved[key] = true
-		delete(p.cooling, key)
-	}
-	p.active = append(p.active, old)
-	releases := p.bindSlotsLocked()
-	p.notifyLocked()
-	p.mu.Unlock()
-
-	if evicted != nil {
-		p.releaseReservation(evicted)
-		evicted.retire()
-	}
-	p.releaseExits(releases)
-	p.startRefill()
 }
 
 func (p *Pool) pruneRotationStateLocked(now time.Time) {

@@ -189,7 +189,7 @@ func (p *Pool) bindSlotsLocked() []*exit {
 		}
 		var candidate *exit
 		for _, e := range p.active {
-			if used[e] || !e.available() || !e.addRef() {
+			if used[e] || !e.available() || !e.addPin() {
 				continue
 			}
 			candidate = e
@@ -221,18 +221,9 @@ func (p *Pool) bindSlotsLocked() []*exit {
 	return releases
 }
 
-func (p *Pool) slotBoundLocked(e *exit) bool {
-	for index := range p.slots {
-		if p.slots[index].exit == e {
-			return true
-		}
-	}
-	return false
-}
-
 func (p *Pool) releaseExits(exits []*exit) {
 	for _, e := range exits {
-		e.release()
+		e.releasePin()
 	}
 }
 
@@ -271,9 +262,6 @@ func (p *Pool) DialSlot(ctx context.Context, slot int, network, address string) 
 	}
 	conn, err := lease.exit.dialContext(ctx, dialNetwork, address)
 	if err != nil {
-		if ctx.Err() == nil {
-			p.penalize(lease.exit, err.Error())
-		}
 		lease.Release()
 		return nil, err
 	}

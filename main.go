@@ -13,11 +13,15 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -27,6 +31,8 @@ import (
 	"NovaVeil_WARP/internal/socks5"
 	"NovaVeil_WARP/internal/warp"
 )
+
+const httpMaxConcurrent = 256
 
 func main() {
 	var (
@@ -40,10 +46,16 @@ func main() {
 		healthEvery   = flag.Duration("health-interval", getenvDuration("WARP_HEALTH_INTERVAL", 60*time.Second), "周期巡检间隔, 0 关闭")
 		sourceIPv6    = flag.String("source-ipv6", getenv("WARP_SOURCE_IPV6", ""), "外层 IPv6 源前缀 (/64 或更短), 留空则不绑定")
 		recentWindow  = flag.Duration("recent-window", getenvDuration("WARP_RECENT_WINDOW", 10*time.Second), "控制 API 无参惩罚时回看的时间窗口")
+		cooldown      = flag.Duration("cooldown", getenvDuration("WARP_COOLDOWN", warp.DefaultEgressCooldown), "被惩罚的配额段重新可用前的等待时长, 负值表示不冷却")
+		memLimit      = flag.String("mem-limit", getenv("WARP_MEM_LIMIT", "300MiB"), "进程内存上限, 如 300MiB; 0 表示不限制")
 	)
 	flag.Parse()
 
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	if *poolSize < 1 || *poolSize > warp.MaxPoolSize {
+		logger.Error("invalid pool-size", "value", *poolSize, "max", warp.MaxPoolSize)
+		os.Exit(1)
+	}
 
 	stackType, err := warp.ParseStack(*stack)
 	if err != nil {
@@ -60,6 +72,18 @@ func main() {
 		}
 	}
 
+	memBytes, err := parseMemoryLimit(*memLimit)
+	if err != nil {
+		logger.Error("invalid mem-limit", "err", err)
+		os.Exit(1)
+	}
+	if memBytes > 0 {
+		// 软上限留两成余量给非堆内存, 避免触到容器硬限被 OOM kill.
+		softLimit := memBytes - memBytes/5
+		debug.SetMemoryLimit(softLimit)
+		logger.Info("memory limit set", "soft_mb", softLimit>>20, "hard_mb", memBytes>>20)
+	}
+
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
@@ -70,6 +94,7 @@ func main() {
 		Stack:               stackType,
 		DisableIPv4Fallback: *noFallback,
 		SourceIPv6:          sourcePrefix,
+		EgressCooldown:      *cooldown,
 	})
 	if err != nil {
 		logger.Error("WARP pool init failed", "err", err)
@@ -90,20 +115,21 @@ func main() {
 	go startSOCKS5(ctx, *socksListen, srv, logger)
 	if *httpListen != "" {
 		proxy := &httpproxy.Server{
-			Dial:    httpproxy.DialFunc(dial),
-			Timeout: 30 * time.Second,
+			Dial:          httpproxy.DialFunc(dial),
+			Timeout:       30 * time.Second,
+			MaxConcurrent: httpMaxConcurrent,
 		}
 		go startHTTPProxy(ctx, *httpListen, proxy, logger)
 	}
 	go startControl(ctx, *controlListen, pool, tracker, logger)
+	go startMemoryWatch(ctx, memBytes, logger)
 
 	logger.Info("NovaVeil_WARP ready", "socks", *socksListen, "http", *httpListen, "control", *controlListen)
 	<-ctx.Done()
 	logger.Info("shutting down")
 }
 
-// makeDialFunc 返回 SOCKS5 / HTTP 代理使用的拨号函数: 从 WARP 池获取租约,
-// 穿透隧道拨号, 连接关闭时释放租约. 拨号失败立即惩罚该隧道.
+// makeDialFunc 返回代理拨号函数, 连接关闭时释放租约.
 func makeDialFunc(pool *warp.Pool, tracker *recentTracker, logger *slog.Logger) socks5.DialFunc {
 	return func(ctx context.Context, network, addr, username string) (net.Conn, error) {
 		if slot, ok := warp.ParseSlotAccount(username); ok {
@@ -126,7 +152,6 @@ func makeDialFunc(pool *warp.Pool, tracker *recentTracker, logger *slog.Logger) 
 		}
 		conn, err := lease.DialContext(ctx, dialNet, addr)
 		if err != nil {
-			pool.Fail(lease, err.Error())
 			lease.Release()
 			return nil, err
 		}
@@ -197,6 +222,8 @@ func startHTTPProxy(ctx context.Context, addr string, handler http.Handler, logg
 	srv := &http.Server{
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 	go func() {
 		<-ctx.Done()
@@ -211,6 +238,7 @@ func startHTTPProxy(ctx context.Context, addr string, handler http.Handler, logg
 // --- 控制 API ---
 
 func startControl(ctx context.Context, addr string, pool *warp.Pool, tracker *recentTracker, logger *slog.Logger) {
+	var probeMu sync.Mutex
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -293,8 +321,14 @@ func startControl(ctx context.Context, addr string, pool *warp.Pool, tracker *re
 	})
 
 	mux.HandleFunc("POST /probe", func(w http.ResponseWriter, r *http.Request) {
+		if !probeMu.TryLock() {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "probe already running", http.StatusServiceUnavailable)
+			return
+		}
+		defer probeMu.Unlock()
 		egress := strings.TrimSpace(r.URL.Query().Get("egress"))
-		probeCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 2*time.Minute)
+		probeCtx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
 		defer cancel()
 		dropped := 0
 		if egress != "" {
@@ -319,9 +353,12 @@ func startControl(ctx context.Context, addr string, pool *warp.Pool, tracker *re
 
 // --- 最近出口追踪 ---
 
+const trackerCompactHead = 64
+
 type recentTracker struct {
 	mu      sync.Mutex
 	entries []egressStamp
+	head    int
 	window  time.Duration
 }
 
@@ -334,29 +371,38 @@ func newRecentTracker(window time.Duration) *recentTracker {
 	return &recentTracker{window: window}
 }
 
+func (rt *recentTracker) pruneLocked(now time.Time) {
+	cutoff := now.Add(-rt.window)
+	for rt.head < len(rt.entries) && !rt.entries[rt.head].at.After(cutoff) {
+		rt.head++
+	}
+	if rt.head == len(rt.entries) {
+		rt.entries = rt.entries[:0]
+		rt.head = 0
+		return
+	}
+	if rt.head >= trackerCompactHead && rt.head*2 >= len(rt.entries) {
+		rt.entries = append(rt.entries[:0], rt.entries[rt.head:]...)
+		rt.head = 0
+	}
+}
+
 func (rt *recentTracker) Record(addr string) {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	now := time.Now()
 	rt.entries = append(rt.entries, egressStamp{addr: addr, at: now})
-	cutoff := now.Add(-rt.window)
-	kept := rt.entries[:0]
-	for _, e := range rt.entries {
-		if e.at.After(cutoff) {
-			kept = append(kept, e)
-		}
-	}
-	rt.entries = kept
+	rt.pruneLocked(now)
 }
 
 func (rt *recentTracker) Recent() []string {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	cutoff := time.Now().Add(-rt.window)
+	rt.pruneLocked(time.Now())
 	seen := make(map[string]bool)
 	var result []string
-	for _, e := range rt.entries {
-		if e.at.After(cutoff) && !seen[e.addr] {
+	for _, e := range rt.entries[rt.head:] {
+		if !seen[e.addr] {
 			seen[e.addr] = true
 			result = append(result, e.addr)
 		}
@@ -368,13 +414,71 @@ func (rt *recentTracker) Recent() []string {
 func (rt *recentTracker) Latest() string {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	cutoff := time.Now().Add(-rt.window)
-	for i := len(rt.entries) - 1; i >= 0; i-- {
-		if rt.entries[i].at.After(cutoff) {
-			return rt.entries[i].addr
+	rt.pruneLocked(time.Now())
+	if len(rt.entries) == 0 {
+		return ""
+	}
+	return rt.entries[len(rt.entries)-1].addr
+}
+
+// --- 内存上限 ---
+
+// parseMemoryLimit 解析 "300MiB" / "512MB" / "1073741824" 形式的内存上限.
+// 0 表示不限制; 非法输入与负数一律报错.
+func parseMemoryLimit(value string) (int64, error) {
+	trimmed := strings.ToUpper(strings.TrimSpace(value))
+	if trimmed == "" {
+		return 0, nil
+	}
+	multiplier := int64(1)
+	for _, unit := range []struct {
+		suffix string
+		factor int64
+	}{
+		{"GIB", 1 << 30}, {"MIB", 1 << 20}, {"KIB", 1 << 10},
+		{"GB", 1 << 30}, {"MB", 1 << 20}, {"KB", 1 << 10},
+		{"B", 1},
+	} {
+		if strings.HasSuffix(trimmed, unit.suffix) {
+			multiplier = unit.factor
+			trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, unit.suffix))
+			break
 		}
 	}
-	return ""
+	size, err := strconv.ParseInt(trimmed, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid memory limit %q", value)
+	}
+	if size < 0 {
+		return 0, fmt.Errorf("memory limit must not be negative: %q", value)
+	}
+	if size > math.MaxInt64/multiplier {
+		return 0, fmt.Errorf("memory limit %q overflows int64", value)
+	}
+	return size * multiplier, nil
+}
+
+// startMemoryWatch 周期性检查进程内存, 超限只告警不自杀.
+// 真正的硬约束由容器的 mem_limit 承担, 进程侧只保证 GC 及时回收.
+func startMemoryWatch(ctx context.Context, limit int64, logger *slog.Logger) {
+	if limit <= 0 {
+		return
+	}
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	var stats runtime.MemStats
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			runtime.ReadMemStats(&stats)
+			used := int64(stats.Sys)
+			if used > limit {
+				logger.Warn("WARP memory above limit", "used_mb", used>>20, "limit_mb", limit>>20)
+			}
+		}
+	}
 }
 
 // --- 环境变量辅助 ---
@@ -386,21 +490,29 @@ func getenv(key, def string) string {
 	return def
 }
 
+func fatalEnv(key, value string, err error) {
+	fmt.Fprintf(os.Stderr, "invalid %s=%q: %v\n", key, value, err)
+	os.Exit(1)
+}
+
 func getenvInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		var n int
-		if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
-			return n
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			fatalEnv(key, v, err)
 		}
+		return n
 	}
 	return def
 }
 
 func getenvDuration(key string, def time.Duration) time.Duration {
-	if v := os.Getenv(key); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			fatalEnv(key, v, err)
 		}
+		return d
 	}
 	return def
 }
@@ -412,6 +524,10 @@ func getenvBool(key string, def bool) bool {
 		return true
 	case "0", "false", "no", "off":
 		return false
+	case "":
+		return def
+	default:
+		fatalEnv(key, v, errors.New("not a boolean"))
+		return def
 	}
-	return def
 }

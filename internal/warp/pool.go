@@ -14,34 +14,22 @@ import (
 
 const DefaultPoolSize = 2
 
+const MaxPoolSize = 32
+
 // DefaultMinSize 是默认池底: 1 个在岗 + 2 个备用.
 const DefaultMinSize = 3
 
-// maxEgressCooldown 是耗尽段冷却的封顶, 防止池子长时间填不满.
-const maxEgressCooldown = 6 * time.Hour
+// DefaultEgressCooldown 是被惩罚的配额段重新可用前的等待时长.
+// 冷却取短值: 换段成本远低于让池子空掉的成本.
+// 早期实现对齐到下一个 UTC 0 点(最长 6 小时), 一次全池换桶就能把池封死.
+const DefaultEgressCooldown = 60 * time.Second
 
 // ipv4FallbackBudget 是 v6 失败后改用 v4 重建的时间预算.
 const ipv4FallbackBudget = 60 * time.Second
 
-// egressCooldownUntil 返回耗尽段的解锁时刻.
-// 免费额度按 UTC 0 点重置, 冷却必须对齐重置点.
-func egressCooldownUntil(now time.Time) time.Time {
-	utc := now.UTC()
-	reset := time.Date(utc.Year(), utc.Month(), utc.Day()+1, 0, 0, 0, 0, time.UTC)
-	if reset.Sub(now) > maxEgressCooldown {
-		return now.Add(maxEgressCooldown)
-	}
-	return reset
-}
-
 // refillRetryDelay spaces out a failed registration attempt. A successful
 // attempt is only limited by the registrar's own 12-second pacing.
 const refillRetryDelay = 5 * time.Second
-
-// scaleDownDelay keeps exits created for a burst hot for a while after the
-// burst, so a following burst reuses them instead of paying for new
-// registrations.
-const scaleDownDelay = 60 * time.Second
 
 // ErrClosed is returned when a pool is used after Close. Callers use it to
 // tell a retiring pool apart from a temporary capacity wait.
@@ -102,13 +90,13 @@ type Pool struct {
 	changed   chan struct{}
 	closed    bool
 	refilling bool
-	scaling   bool
 	wait      sync.WaitGroup
 	createMu  sync.Mutex
 
 	slots        []slot
 	pins         int
 	sourcePrefix netip.Prefix
+	cooldown     time.Duration
 
 	rotateMu         sync.Mutex
 	lastRotateStart  time.Time
@@ -142,9 +130,7 @@ type Snapshot struct {
 
 // Options configure a WARP pool.
 type Options struct {
-	// Size is the upper bound on exits. The pool keeps as many exits hot as
-	// the current concurrency needs (leases in flight plus queued requests,
-	// plus a spare) and never exceeds Size.
+	// Size is the fixed number of hot exits; every slot stays bound to one.
 	Size int
 	// MinSize 是空闲时也保活的出口下限, 小于 2 时按 2 处理.
 	MinSize int
@@ -159,11 +145,17 @@ type Options struct {
 	// replacement reaches Cloudflare from a new source and receives a new
 	// public egress — the only way past an egress-scoped free usage limit.
 	SourceIPv6 netip.Prefix
+	// EgressCooldown 是被惩罚的配额段再次可用前的等待时长.
+	// 零值即用 DefaultEgressCooldown.
+	EgressCooldown time.Duration
 }
 
 // NewWithOptions creates a WARP pool whose exits use the selected IP stack and,
 // optionally, rotate their outer IPv6 source within a prefix.
 func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool, error) {
+	if opts.Size < 1 || opts.Size > MaxPoolSize {
+		return nil, fmt.Errorf("WARP pool size must be between 1 and %d, got %d", MaxPoolSize, opts.Size)
+	}
 	normalized, err := ParseStack(string(opts.Stack))
 	if err != nil {
 		return nil, err
@@ -205,6 +197,10 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 	}
 	pool.stack = normalized
 	pool.sourcePrefix = opts.SourceIPv6
+	pool.cooldown = opts.EgressCooldown
+	if pool.cooldown == 0 {
+		pool.cooldown = DefaultEgressCooldown
+	}
 	return pool, nil
 }
 
@@ -460,7 +456,7 @@ func (p *Pool) Check(ctx context.Context) int {
 	p.mu.Lock()
 	candidates := make([]*exit, 0, len(p.active))
 	for _, active := range p.active {
-		if active.idle() && !p.slotBoundLocked(active) {
+		if active.idle() {
 			candidates = append(candidates, active)
 		}
 	}
@@ -535,7 +531,7 @@ func (p *Pool) penalize(bad *exit, reason string) {
 		return
 	}
 	if key := bad.egressKey(); key != "" {
-		p.cooling[key] = egressCooldownUntil(time.Now())
+		p.cooling[key] = time.Now().Add(p.cooldown)
 		delete(p.reserved, key)
 	}
 	p.active = append(p.active[:index], p.active[index+1:]...)
@@ -547,6 +543,7 @@ func (p *Pool) penalize(bad *exit, reason string) {
 	p.wait.Add(1)
 	p.mu.Unlock()
 
+	bad.retire()
 	p.releaseExits(releases)
 	if p.logger != nil {
 		p.logger.Warnf("Rotating OpenCode WARP egress %s (%s)", bad.id, reason)
@@ -615,9 +612,7 @@ func (p *Pool) startRefill() {
 	}()
 }
 
-// released records that a lease was returned and trims the ring back toward
-// the demand of the moment. Freed exits stay hot for scaleDownDelay, so a
-// burst that pauses does not immediately pay for re-registering them.
+// released records that a lease was returned and refills below the slot target.
 func (p *Pool) released() {
 	p.mu.Lock()
 	if p.inflight > 0 {
@@ -625,57 +620,12 @@ func (p *Pool) released() {
 	}
 	closed := p.closed
 	wantRefill := !closed && len(p.active) < p.desiredLocked()
-	started := p.scaling
-	if !closed && !started && len(p.active) > p.desiredLocked() {
-		p.scaling = true
-		started = true
-	}
 	p.mu.Unlock()
 	if closed {
 		return
 	}
 	if wantRefill {
 		p.startRefill()
-	}
-	if started {
-		p.after(scaleDownDelay, p.scaleDown)
-	}
-}
-
-// scaleDown retires every idle exit above the current demand. Busy surplus
-// exits are left to their release, which arms another pass if the ring is
-// still over target then.
-func (p *Pool) scaleDown() {
-	p.mu.Lock()
-	p.scaling = false
-	if p.closed {
-		p.mu.Unlock()
-		return
-	}
-	want := p.desiredLocked()
-	var dropped []*exit
-	if surplus := len(p.active) - want; surplus > 0 {
-		kept := p.active[:0]
-		for _, candidate := range p.active {
-			if surplus > 0 && candidate.idle() && !p.slotBoundLocked(candidate) {
-				dropped = append(dropped, candidate)
-				surplus--
-				continue
-			}
-			kept = append(kept, candidate)
-		}
-		p.active = kept
-	}
-	if p.next >= len(p.active) {
-		p.next = 0
-	}
-	p.mu.Unlock()
-	for _, drop := range dropped {
-		p.releaseReservation(drop)
-		drop.retire()
-		if p.logger != nil {
-			p.logger.Infof("OpenCode WARP egress %s scaled down at %s", drop.id, drop.egress)
-		}
 	}
 }
 
@@ -790,7 +740,7 @@ func (p *Pool) Close() {
 
 	p.cancel()
 	for _, item := range slotExits {
-		item.release()
+		item.releasePin()
 	}
 	for _, item := range active {
 		p.releaseReservation(item)
