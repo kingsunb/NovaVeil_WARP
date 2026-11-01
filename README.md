@@ -4,7 +4,6 @@ NovaVeil_WARP 是单容器 Cloudflare WARP 代理，同时提供 SOCKS5（默认
 进程内池化多个 WARP 隧道，每个隧道一个出口 IP。
 控制 API 收到 429 回报后淘汰对应隧道并后台轮换，403 视为形态/身份信号不换出口。
 同时提供稳定的槽位账号，把并发请求固定到不同出口。
-开启节点库后，注册凭据跨重启保存，第二天（美东 0 点后）用同一份注册重建隧道，取回昨天的出口，而不是重新注册碰运气。
 
 纯用户态（WireGuard-go + gVisor netstack），**不需要 TUN 设备、root、NET_ADMIN**。
 
@@ -12,17 +11,16 @@ NovaVeil_WARP 是单容器 Cloudflare WARP 代理，同时提供 SOCKS5（默认
 
 ```
 启动 → 注册第 1 个隧道（同步）→ 后台填到池底（默认 3 个，12 秒间隔）
-运行 → 池里常驻 N 个热隧道（N 个不同出口段）
+运行 → 池里常驻 N 个热隧道（N 个不同出口地址）
        → 每个 SOCKS5 / HTTP 代理连接轮询取一个
        → HTTP 代理支持 CONNECT（HTTPS 隧道）和 absolute-URI（纯 HTTP 转发）
        → 每 60 秒巡检空闲隧道，探不通即淘汰补位
-       → 控制 API 报 429 → 轮换该隧道 → 优先复用节点库里的旧注册，无可用才重新注册
+       → 控制 API 报 429 → 轮换该隧道 → 后台注册新隧道替换
        → 槽位账号 warp-0..warp-N-1 固定到各自出口
        → 用户永远拿到热隧道，不等注册
 ```
 
-WARP 免费注册无次数上限，但 Cloudflare 的出口 /64 来自有限集合：重新注册拿到的新 /128 常常仍落在同一个 /64，配额作用域没变。
-因此轮换不能扩容，**跨日复用才是扩容手段**：节点库把注册凭据按 /64 存盘，每天每个段最多激活一次，第二天配额重置后优先取昨天成功过的节点。
+重新注册会换一个 /128，出口按完整地址去重，因此同一 /64 下可以并存多个 /128。但 /64 来自 Cloudflare 的有限分配集合，若上游配额按 /64 计，同段地址仍共享限额。
 
 ### 两种 IP 多样性档位
 
@@ -33,22 +31,9 @@ WARP 免费注册无次数上限，但 Cloudflare 的出口 /64 来自有限集�
 
 ### 地址族：IPv6 优先，IPv4 兜底
 
-默认 `-stack ipv6`。v6 隧道建不起来时（注册不带 v6 地址、外层源绑定失败、v6 探测不通），用**同一份注册**里的 v4 地址重建，不重新注册、不浪费 12 秒注册间隔。
+默认 `-stack ipv6`。v6 隧道建不起来时（注册不带 v6 地址、外层源绑定失败、v6 探测不通），用**同一份注册**里的 v4 地址重建，不重新注册、不浪费注册间隔。
 
 v4 出口是 Cloudflare NAT 后的共享地址，配额通常已被别人耗尽，所以这档只是保命，不是长久之计。`/status` 的 `Fallback` 字段显示当前有几个出口在走 v4；非零就说明 v6 链路有问题。
-
-### 节点库：跨日复用
-
-`-node-db` 指向一个 JSON 文件（容器里建议挂 `/data/nodes.json`）。启用后：
-
-- 入池的隧道把注册凭据（ID/Token/私钥/对端公钥/隧道地址/endpoint）按配额段（IPv6 取 `/64`，IPv4 取 `/32`）落库；
-- 撞段被丢弃的候选也入库，不再白烧一次注册；
-- 补池与轮换优先复用「今天还没激活过」的节点：先取历史成功过的（`Success > 0`），再取其余；每个段每天最多激活一次；
-- 日界按 `-node-tz` 计算（默认 `America/New_York`），跨过 0 点后所有节点重新可选；
-- 复用后重探出口，段落漂移（Cloudflare 重新分配）时记录迁到新段继续用，日志打 `WARP node <旧段> came back on <新段>`；
-- 连续 3 次重建失败的节点置 `disabled`，不再参与选号。
-
-在岗且健康的出口不会被日界强制换掉，日界只决定「下一次补池或轮换取谁」。节点库文件含私钥与设备 Token，落盘权限 `0600`。
 
 ## 用法
 
@@ -102,9 +87,7 @@ curl -x socks5h://warp-0:any@127.0.0.1:1080 https://api.ipify.org
 | `-health-interval` | `WARP_HEALTH_INTERVAL` | `60s` | 周期巡检间隔，`0` 关闭 |
 | `-source-ipv6` | `WARP_SOURCE_IPV6` | 空 | 外层 IPv6 源前缀（/64 或更短） |
 | `-recent-window` | `WARP_RECENT_WINDOW` | `10s` | 无参惩罚回看时间窗口 |
-| `-cooldown` | `WARP_COOLDOWN` | `60s` | 被惩罚的配额段重新可用前的等待时长，负值表示不冷却 |
-| `-node-db` | `WARP_NODE_DB` | 空（关闭） | 节点库落盘路径，挂 `/data/nodes.json` 即启用跨日复用 |
-| `-node-tz` | `WARP_NODE_TZ` | `America/New_York` | 节点库日界时区 |
+| `-cooldown` | `WARP_COOLDOWN` | `60s` | 被惩罚出口重新可用前的等待时长，负值表示不冷却 |
 | `-mem-limit` | `WARP_MEM_LIMIT` | `300MiB` | 进程内存上限，`0` 表示不限制 |
 
 ### 控制 API
@@ -121,14 +104,6 @@ curl http://localhost:1081/status
 curl http://localhost:1081/slots
 # {"size":4,"updated_at":"...","slots":[{"slot":0,"account":"warp-0",...}]}
 
-# 节点库：汇总 + 脱敏列表（不含注册凭据）
-curl http://localhost:1081/nodes
-
-# NovaVeil 回报该出口真实成功过 / 当天被 429
-curl -X POST 'http://localhost:1081/nodes/success?egress=2a09:bac5:...'
-curl -X POST 'http://localhost:1081/nodes/fail?egress=2a09:bac5:...&reason=429'
-# {"matched":true}
-
 # 健康检查
 curl http://localhost:1081/healthz
 
@@ -139,7 +114,7 @@ curl -X POST 'http://localhost:1081/penalize?egress=2606:4700:...&reason=429'
 curl -X POST http://localhost:1081/penalize
 # {"penalized":1}
 
-# 主动换桶：淘汰全部在岗出口，后台补新段
+# 主动换桶：淘汰全部在岗出口，后台补新出口
 curl -X POST 'http://localhost:1081/rotate?all=1'
 # {"rotated":3}
 
@@ -148,16 +123,16 @@ curl -X POST http://localhost:1081/probe
 # {"dropped":0}
 ```
 
-被淘汰的出口段进入冷却，默认 60 秒后重新可用（`-cooldown` 可调，负值表示不冷却）。冷却期间重新抽到同一段会被丢弃重抽。冷却取短值是刻意的：换段成本远低于让池子空掉的成本，早期实现把段锁到下一个 UTC 0 点（最长 6 小时），一次全池换桶就能把池封死。
+被淘汰的出口进入冷却，默认 60 秒后重新可用（`-cooldown` 可调，负值表示不冷却）。冷却期间重新抽到同一地址会被丢弃重抽。冷却取短值是刻意的：换地址成本远低于让池子空掉的成本，早期实现把出口锁到下一个 UTC 0 点（最长 6 小时），一次全池换桶就能把池封死。
 
 ### 轮换策略
 
 429 触发轮换，403 不触发（形态/身份信号，换出口无益）。
 目标站自身的 DNS 失败、连接拒绝等拨号错误不触发轮换，避免误杀健康出口。
-没有外层源绑定（`-source-ipv6` 为空）时，复用旧注册必然拿到同一个出口段，因此不再做 soft restart，直接进入换段：先问节点库，再注册新设备。
-有外层源绑定时才先试 soft restart，落点仍在同一 /64 才升级为换段重建。
-全池轮换串行执行，相邻两次至少间隔 4 秒；单出口 key 每小时最多 60 次，全池 full re-key 每小时最多 60 次。
-连续失败按 15 * 2^n 秒退避，封顶 300 秒；轮换失败、退避或预算耗尽时旧出口保持退役与冷却，由后台补池提供替代容量，不会无限重试。
+轮换先复用旧注册、换外层源地址做 soft restart；新出口的完整地址与旧出口相同才做 full re-key。
+soft restart 落点若仍是同一个地址，轮换会自动改走 full re-key 重建，不会原地重试。
+全池轮换串行执行，相邻两次至少间隔 1 秒；单出口 key 每小时最多 60 次，全池 full re-key 每小时最多 180 次。
+连续失败按 5 * 2^n 秒退避，封顶 60 秒；轮换失败、退避或预算耗尽时旧出口保持退役与冷却，由后台补池提供替代容量，不会无限重试。
 
 ## Docker
 
@@ -166,21 +141,12 @@ docker build -t novaveil_warp .
 docker run -d --name NovaVeil_WARP_socks5 \
   -p 127.0.0.1:1080:1080 -p 127.0.0.1:8080:8080 -p 127.0.0.1:1081:1081 \
   --memory=300m --cpus=1.0 \
-  -v /srv/warp-data:/data \
   -e WARP_MIN_POOL=3 \
   -e WARP_POOL_SIZE=8 \
-  -e WARP_NODE_DB=/data/nodes.json \
-  -e WARP_NODE_TZ=America/New_York \
   novaveil_warp
 ```
 
 容器/服务名默认用 `NovaVeil_WARP_socks5`；镜像仓库名用小写 `novaveil_warp`（Docker 要求）。
-
-节点库目录要先建好并交给容器用户，否则 `WARP_NODE_DB` 会因为无写权限在补池时报错：
-
-```sh
-mkdir -p /srv/warp-data && chown 10001:10001 /srv/warp-data
-```
 
 内存默认上限 300MB：进程内 `debug.SetMemoryLimit` 取上限的 80% 让 GC 提前回收，容器 `--memory=300m` 兜底硬约束，两者都要配。
 
@@ -215,16 +181,12 @@ services:
     restart: unless-stopped
     mem_limit: 300m
     cpus: "1.0"
-    volumes:
-      - ./warp-data:/data
     environment:
       WARP_MIN_POOL: "3"
       WARP_POOL_SIZE: "8"
       WARP_STACK: "ipv6"
       WARP_HEALTH_INTERVAL: "60s"
       WARP_COOLDOWN: "60s"
-      WARP_NODE_DB: "/data/nodes.json"
-      WARP_NODE_TZ: "America/New_York"
       WARP_MEM_LIMIT: "300MiB"
       # WARP_SOURCE_IPV6: "2001:db8::/64"  # 有 /64 前缀才填
     networks:
@@ -249,9 +211,6 @@ http://NovaVeil_WARP_socks5:8080
 NovaVeil 检测到代理地址含 `NovaVeil_WARP_socks5` 时，自动在 429 后向
 `http://NovaVeil_WARP_socks5:1081/penalize` 发异步 POST，淘汰最近一次拨号的出口（单次最多 1 个）并重试。
 惩罚会关闭旧出口上已建立的连接（替换隧道就绪后立即断开），强制客户端重新建连并拿到新 IP；否则长连接会继续复用旧出口。
-
-槽位模式下另有两条只记账、不换出口的回报：成功请求按出口打 `/nodes/success`（同一出口 10 分钟内最多一次），
-单槽 429 打 `/nodes/fail?reason=429`。它们只更新节点库的成败计数与「今天已用过」标记，供第二天选号使用。
 
 ### 3. 工作流程
 

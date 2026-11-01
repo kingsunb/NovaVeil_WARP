@@ -138,7 +138,7 @@ func (p *Pool) slotViewLocked(index int, now time.Time) SlotView {
 	if s.exit.egress.IsValid() {
 		view.Egress = s.exit.egress.String()
 	}
-	view.Prefix = s.exit.egressKey()
+	view.Prefix = egressPrefix(s.exit.egress)
 	if until := p.coolingUntilLocked(s.exit, now); !until.IsZero() {
 		view.State = SlotCooling
 		view.CoolingUntil = until.UTC().Format(time.RFC3339)

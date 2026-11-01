@@ -617,10 +617,13 @@ func (e *exit) dialNetwork() string {
 }
 
 func (e *exit) egressKey() string {
-	return egressPrefix(e.egress)
+	if !e.egress.IsValid() {
+		return ""
+	}
+	return e.egress.String()
 }
 
-// egressPrefix 返回 IPv6 /64 或 IPv4 /32 的配额键.
+// egressPrefix 返回展示用的 IPv6 /64 或 IPv4 /32.
 func egressPrefix(addr netip.Addr) string {
 	if addr.Is4() {
 		return netip.PrefixFrom(addr, 32).Masked().String()
@@ -628,19 +631,15 @@ func egressPrefix(addr netip.Addr) string {
 	if !addr.Is6() {
 		return ""
 	}
-	// The free tier treats a Cloudflare /64 as one quota scope: rotating inside
-	// the same /64 yields a new /128 but the same exhausted quota. Keying on
-	// the /64 keeps every active and cooling exit on a distinct scope, so a
-	// replacement is a real rotation rather than a cosmetic address change.
 	return netip.PrefixFrom(addr, 64).Masked().String()
 }
 
-// sameEgressPrefix 判断两个出口是否落在同一配额段.
-func sameEgressPrefix(a, b netip.Addr) bool {
+// sameEgress 判断两个出口是否为同一地址.
+func sameEgress(a, b netip.Addr) bool {
 	if !a.IsValid() || !b.IsValid() {
 		return false
 	}
-	return egressPrefix(a) == egressPrefix(b)
+	return a == b
 }
 
 // idle reports whether no lease currently holds this exit.

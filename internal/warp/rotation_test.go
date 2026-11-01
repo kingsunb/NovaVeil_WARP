@@ -12,13 +12,13 @@ func TestRotationBackoff(t *testing.T) {
 		failures int
 		want     time.Duration
 	}{
-		{0, 15 * time.Second},
-		{1, 30 * time.Second},
-		{2, 60 * time.Second},
-		{3, 120 * time.Second},
-		{4, 240 * time.Second},
-		{5, 300 * time.Second},
-		{10, 300 * time.Second},
+		{0, 5 * time.Second},
+		{1, 10 * time.Second},
+		{2, 20 * time.Second},
+		{3, 40 * time.Second},
+		{4, 60 * time.Second},
+		{5, 60 * time.Second},
+		{10, 60 * time.Second},
 	}
 	for _, tc := range cases {
 		if got := rotationBackoff(tc.failures); got != tc.want {
@@ -60,14 +60,14 @@ func TestFullRekeyBudget(t *testing.T) {
 func TestRotationFailureBackoff(t *testing.T) {
 	p := &Pool{rotationFailures: make(map[string]rotationFailure)}
 	now := time.Now()
-	if delay := p.recordRotationFailureLocked("2001:db8::/64", now); delay != 15*time.Second {
-		t.Fatalf("first delay = %s, want 15s", delay)
+	if delay := p.recordRotationFailureLocked("2001:db8::/64", now); delay != 5*time.Second {
+		t.Fatalf("first delay = %s, want 5s", delay)
 	}
-	if delay := p.recordRotationFailureLocked("2001:db8::/64", now); delay != 30*time.Second {
-		t.Fatalf("second delay = %s, want 30s", delay)
+	if delay := p.recordRotationFailureLocked("2001:db8::/64", now); delay != 10*time.Second {
+		t.Fatalf("second delay = %s, want 10s", delay)
 	}
 	failure := p.rotationFailures["2001:db8::/64"]
-	if failure.count != 2 || !failure.until.Equal(now.Add(30*time.Second)) {
+	if failure.count != 2 || !failure.until.Equal(now.Add(10*time.Second)) {
 		t.Fatalf("failure = %+v", failure)
 	}
 	p.clearRotationFailureLocked("2001:db8::/64")
@@ -76,7 +76,7 @@ func TestRotationFailureBackoff(t *testing.T) {
 	}
 }
 
-// TestEgressCooldownIsShort 锁定「不锁池」语义: 冷却是短 TTL, 到期即释放配额段.
+// TestEgressCooldownIsShort 锁定「不锁池」语义: 冷却是短 TTL, 到期即释放出口.
 func TestEgressCooldownIsShort(t *testing.T) {
 	if DefaultEgressCooldown > 5*time.Minute {
 		t.Fatalf("default cooldown %s too long, would empty the pool", DefaultEgressCooldown)
@@ -177,25 +177,38 @@ func TestEgressPrefix(t *testing.T) {
 	}
 }
 
-func TestSameEgressPrefix(t *testing.T) {
+func TestEgressKeyUsesFullAddress(t *testing.T) {
+	e := &exit{egress: netip.MustParseAddr("2001:db8:1:2::1")}
+	if got := e.egressKey(); got != "2001:db8:1:2::1" {
+		t.Fatalf("egressKey = %q", got)
+	}
+	if got := egressPrefix(e.egress); got != "2001:db8:1:2::/64" {
+		t.Fatalf("display prefix = %q", got)
+	}
+}
+
+func TestSameEgress(t *testing.T) {
 	same64a := netip.MustParseAddr("2001:db8:1:2::1")
 	same64b := netip.MustParseAddr("2001:db8:1:2::ffff")
 	other64 := netip.MustParseAddr("2001:db8:1:3::1")
 	v4a := netip.MustParseAddr("203.0.113.7")
 	v4b := netip.MustParseAddr("203.0.113.8")
-	if !sameEgressPrefix(same64a, same64b) {
-		t.Fatal("same /64 must match")
+	if sameEgress(same64a, same64b) {
+		t.Fatal("different /128 in same /64 must not match")
 	}
-	if sameEgressPrefix(same64a, other64) {
-		t.Fatal("different /64 must not match")
+	if !sameEgress(same64a, same64a) {
+		t.Fatal("same address must match")
 	}
-	if !sameEgressPrefix(v4a, v4a) {
-		t.Fatal("same /32 must match")
+	if sameEgress(same64a, other64) {
+		t.Fatal("different address must not match")
 	}
-	if sameEgressPrefix(v4a, v4b) {
-		t.Fatal("different /32 must not match")
+	if !sameEgress(v4a, v4a) {
+		t.Fatal("same IPv4 must match")
 	}
-	if sameEgressPrefix(netip.Addr{}, same64a) {
+	if sameEgress(v4a, v4b) {
+		t.Fatal("different IPv4 must not match")
+	}
+	if sameEgress(netip.Addr{}, same64a) {
 		t.Fatal("invalid address must not match")
 	}
 }
