@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 )
@@ -103,6 +104,10 @@ type Pool struct {
 	keyRotations     map[string][]time.Time
 	fullRekeys       []time.Time
 	rotationFailures map[string]rotationFailure
+
+	// nodes 是跨重启的出口节点库, 关闭时不落盘.
+	nodes   *nodeStore
+	tracker *prefixTracker
 }
 
 type Lease struct {
@@ -148,6 +153,10 @@ type Options struct {
 	// EgressCooldown 是被惩罚的配额段再次可用前的等待时长.
 	// 零值即用 DefaultEgressCooldown.
 	EgressCooldown time.Duration
+	// NodeDB 是节点库落盘路径, 空串表示不启用跨重启复用.
+	NodeDB string
+	// NodeZone 是节点库日界时区, 空串用美东.
+	NodeZone string
 }
 
 // NewWithOptions creates a WARP pool whose exits use the selected IP stack and,
@@ -168,7 +177,11 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 		size = DefaultPoolSize
 	}
 	r := newRegistrar()
-	pool, err := newPool(ctx, slogLogger{log: log}, size, opts.MinSize, func(ctx context.Context) (*exit, error) {
+	store, storeErr := openNodeStore(opts.NodeDB, opts.NodeZone)
+	if storeErr != nil {
+		return nil, storeErr
+	}
+	pool, err := newPool(ctx, slogLogger{log: log}, size, opts.MinSize, store, func(ctx context.Context) (*exit, error) {
 		reg, err := r.register(ctx)
 		if err != nil {
 			return nil, err
@@ -193,6 +206,9 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 		return newExitWithStack(fallbackCtx, reg, StackIPv4, netip.Addr{})
 	})
 	if err != nil {
+		if store != nil {
+			_ = store.Close()
+		}
 		return nil, err
 	}
 	pool.stack = normalized
@@ -201,6 +217,7 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 	if pool.cooldown == 0 {
 		pool.cooldown = DefaultEgressCooldown
 	}
+	pool.startNodeFlush()
 	return pool, nil
 }
 
@@ -227,7 +244,7 @@ func randomSource(prefix netip.Prefix) (netip.Addr, error) {
 	return netip.AddrFrom16(address), nil
 }
 
-func newPool(ctx context.Context, log logger, size int, minSize int, create func(context.Context) (*exit, error)) (*Pool, error) {
+func newPool(ctx context.Context, log logger, size int, minSize int, store *nodeStore, create func(context.Context) (*exit, error)) (*Pool, error) {
 	if size <= 0 {
 		size = DefaultPoolSize
 	}
@@ -259,6 +276,8 @@ func newPool(ctx context.Context, log logger, size int, minSize int, create func
 		slots:            make([]slot, size),
 		keyRotations:     make(map[string][]time.Time),
 		rotationFailures: make(map[string]rotationFailure),
+		nodes:            store,
+		tracker:          newPrefixTracker(),
 	}
 	first, err := p.createExit(ctx)
 	if err != nil {
@@ -429,6 +448,106 @@ func (p *Pool) CoolingUntil() map[string]time.Time {
 	return cooling
 }
 
+// NodeStats 返回节点库汇总, 未启用时 Enabled 为 false.
+func (p *Pool) NodeStats() NodeStats {
+	if p.nodes == nil {
+		return NodeStats{}
+	}
+	return p.nodes.stats(time.Now())
+}
+
+// NodeViews 返回脱敏节点列表.
+func (p *Pool) NodeViews(limit int) []NodeView {
+	if p.nodes == nil {
+		return nil
+	}
+	return p.nodes.views(limit)
+}
+
+// MarkNodeSuccess 按完整出口记账成功.
+func (p *Pool) MarkNodeSuccess(egress string) bool {
+	if p.nodes == nil {
+		return false
+	}
+	egress = strings.TrimSpace(egress)
+	if egress == "" {
+		return false
+	}
+	return p.nodes.success(egress, time.Now())
+}
+
+// MarkNodeFail 记录出口当天失败.
+func (p *Pool) MarkNodeFail(egress, reason string) bool {
+	if p.nodes == nil {
+		return false
+	}
+	key := egressPrefixOf(egress)
+	if key == "" {
+		return false
+	}
+	if reason == "" {
+		reason = "unknown"
+	}
+	p.nodes.fail(key, reason, time.Now())
+	return true
+}
+
+// Prefixes 返回每段的分配数与限流计数.
+func (p *Pool) Prefixes() []PrefixStat {
+	p.mu.Lock()
+	active := make(map[string]int, len(p.active))
+	cooling := make(map[string]bool, len(p.cooling))
+	now := time.Now()
+	for _, item := range p.active {
+		if key := item.egressKey(); key != "" {
+			active[key]++
+		}
+	}
+	for key, until := range p.cooling {
+		if until.After(now) {
+			cooling[key] = true
+		}
+	}
+	p.mu.Unlock()
+	return p.tracker.snapshot(active, cooling)
+}
+
+// Rotation 返回轮换与复用计数.
+func (p *Pool) Rotation() RotationStats {
+	return p.tracker.rotation()
+}
+
+func egressPrefixOf(value string) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(value))
+	if err != nil {
+		return ""
+	}
+	return egressPrefix(addr)
+}
+
+// startNodeFlush 周期落盘节点库.
+func (p *Pool) startNodeFlush() {
+	if p.nodes == nil {
+		return
+	}
+	p.wait.Add(1)
+	go func() {
+		defer p.wait.Done()
+		ticker := time.NewTicker(nodeFlushInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-p.ctx.Done():
+				return
+			case <-ticker.C:
+				if err := p.nodes.flush(); err != nil && p.logger != nil {
+					p.logger.Warnf("Flush WARP node store: %v", err)
+				}
+			}
+		}
+	}()
+}
+
 // StartHealthCheck 启动周期巡检, interval 小于等于 0 时不启动.
 func (p *Pool) StartHealthCheck(interval time.Duration) {
 	if interval <= 0 {
@@ -533,6 +652,13 @@ func (p *Pool) penalize(bad *exit, reason string) {
 	if key := bad.egressKey(); key != "" {
 		p.cooling[key] = time.Now().Add(p.cooldown)
 		delete(p.reserved, key)
+		if p.nodes != nil {
+			// 429 只让节点今天歇着, 凭据留着明天再用.
+			p.nodes.fail(key, reason, time.Now())
+		}
+		if strings.Contains(reason, "429") {
+			p.tracker.rateLimited(key)
+		}
 	}
 	p.active = append(p.active[:index], p.active[index+1:]...)
 	if p.next >= len(p.active) {
@@ -644,47 +770,176 @@ func (p *Pool) after(delay time.Duration, fn func()) {
 	}()
 }
 
+// createExit 取一个可入池的出口: 先复用历史节点, 再注册新设备.
 func (p *Pool) createExit(ctx context.Context) (*exit, error) {
 	p.createMu.Lock()
 	defer p.createMu.Unlock()
 	var lastErr error
-	for attempt := 0; attempt < 4; attempt++ {
+	for attempt := 0; attempt < createAttempts; attempt++ {
 		p.mu.Lock()
 		closed := p.closed
 		p.mu.Unlock()
 		if closed {
 			return nil, ErrClosed
 		}
-		candidate, err := p.newExit(ctx)
+		candidate, err := p.nextExit(ctx)
 		if err != nil {
 			return nil, err
 		}
 		key := candidate.egressKey()
-		now := time.Now()
-		p.mu.Lock()
-		for subnet, until := range p.cooling {
-			if !until.After(now) {
-				delete(p.cooling, subnet)
+		if p.reserveKey(key) {
+			p.recordNode(candidate)
+			if p.nodes != nil {
+				p.nodes.claim(key, time.Now())
 			}
-		}
-		usable := key != "" && !p.reserved[key] && !p.cooling[key].After(now)
-		if usable {
-			p.reserved[key] = true
-		}
-		p.mu.Unlock()
-		if usable {
 			if p.logger != nil {
 				p.logger.Infof("OpenCode WARP/%s egress %s ready at %s", candidate.stack, candidate.id, candidate.egress)
 			}
 			return candidate, nil
 		}
 		lastErr = fmt.Errorf("WARP egress %s is already active or cooling down", key)
+		p.tracker.count(rotationRejected)
 		if p.logger != nil {
 			p.logger.Warnf("Discarding duplicate WARP exit %s: %v", candidate.id, lastErr)
 		}
+		// 撞段不丢注册, 留作后续日界复用.
+		p.keepNode(candidate)
 		candidate.close()
 	}
 	return nil, lastErr
+}
+
+// nextExit 优先复用节点库, 没有可复用节点才注册.
+func (p *Pool) nextExit(ctx context.Context) (*exit, error) {
+	if p.nodes != nil {
+		skip := p.busyPrefixes()
+		for restored := 0; restored < restoreAttempts; restored++ {
+			record, ok := p.nodes.pick(time.Now(), skip)
+			if !ok {
+				break
+			}
+			skip[record.Prefix] = true
+			candidate, err := p.reviveExit(ctx, record)
+			if err != nil {
+				p.tracker.count(rotationRestoreFail)
+				if p.logger != nil {
+					p.logger.Warnf("Cannot revive WARP node %s (%s): %v", record.Prefix, record.Egress, err)
+				}
+				continue
+			}
+			p.tracker.count(rotationRestored)
+			p.tracker.allocate(candidate.egress)
+			return candidate, nil
+		}
+	}
+	p.tracker.count(rotationRegistered)
+	candidate, err := p.newExit(ctx)
+	if err != nil {
+		return nil, err
+	}
+	p.tracker.allocate(candidate.egress)
+	return candidate, nil
+}
+
+// reviveExit 用库里注册重建隧道, 段漂移时按新段记账.
+func (p *Pool) reviveExit(ctx context.Context, record nodeRecord) (*exit, error) {
+	var source netip.Addr
+	if record.Source != "" {
+		parsed, err := netip.ParseAddr(record.Source)
+		if err != nil {
+			p.nodes.buildFail(record.Prefix, time.Now())
+			return nil, fmt.Errorf("invalid WARP node source %q: %w", record.Source, err)
+		}
+		source = parsed
+	}
+	// 失效注册可能在探活上耗很久, 单次重建设预算.
+	reviveCtx, cancel := context.WithTimeout(ctx, reviveBudget)
+	defer cancel()
+	candidate, err := newExitWithStack(reviveCtx, record.Reg, record.Stack, source)
+	if err != nil {
+		p.nodes.buildFail(record.Prefix, time.Now())
+		return nil, err
+	}
+	if observed := candidate.egressKey(); observed != "" && observed != record.Prefix {
+		if p.logger != nil {
+			p.logger.Warnf("WARP node %s came back on %s", record.Prefix, observed)
+		}
+		p.nodes.drift(record.Prefix, candidate.egress.String(), observed, time.Now())
+	}
+	return candidate, nil
+}
+
+// reserveKey 尝试占用配额段, 已占用或冷却中返回 false.
+func (p *Pool) reserveKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for subnet, until := range p.cooling {
+		if !until.After(now) {
+			delete(p.cooling, subnet)
+		}
+	}
+	if p.reserved[key] || p.cooling[key].After(now) {
+		return false
+	}
+	p.reserved[key] = true
+	return true
+}
+
+// busyPrefixes 返回当前不可复用的配额段.
+func (p *Pool) busyPrefixes() map[string]bool {
+	now := time.Now()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	busy := make(map[string]bool, len(p.reserved)+len(p.cooling))
+	for key := range p.reserved {
+		busy[key] = true
+	}
+	for key, until := range p.cooling {
+		if until.After(now) {
+			busy[key] = true
+		}
+	}
+	return busy
+}
+
+// recordNode 把成功入池的出口写回节点库.
+func (p *Pool) recordNode(candidate *exit) {
+	if p.nodes == nil || candidate == nil || !candidate.egress.IsValid() {
+		return
+	}
+	key := candidate.egressKey()
+	if key == "" {
+		return
+	}
+	p.nodes.put(nodeRecord{
+		Prefix: key,
+		Egress: candidate.egress.String(),
+		Stack:  candidate.stack,
+		Source: sourceString(candidate.source),
+		Reg:    candidate.reg,
+	}, time.Now())
+}
+
+// keepNode 保留撞段候选的注册, 已有该段记录时不覆盖.
+func (p *Pool) keepNode(candidate *exit) {
+	if p.nodes == nil || candidate == nil || !candidate.egress.IsValid() {
+		return
+	}
+	if key := candidate.egressKey(); key == "" || p.nodes.has(key) {
+		return
+	}
+	p.recordNode(candidate)
+}
+
+func sourceString(addr netip.Addr) string {
+	if !addr.IsValid() {
+		return ""
+	}
+	return addr.String()
 }
 
 func (p *Pool) releaseReservation(e *exit) {
@@ -747,6 +1002,11 @@ func (p *Pool) Close() {
 		item.retire()
 	}
 	p.wait.Wait()
+	if p.nodes != nil {
+		if err := p.nodes.Close(); err != nil && p.logger != nil {
+			p.logger.Warnf("Close WARP node store: %v", err)
+		}
+	}
 }
 
 func (l *Lease) DialContext(ctx context.Context, network, address string) (net.Conn, error) {

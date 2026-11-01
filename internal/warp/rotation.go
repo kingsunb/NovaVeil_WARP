@@ -96,8 +96,9 @@ func (p *Pool) rotate(old *exit, reason string) {
 	}
 	p.lastRotateStart = now
 	p.keyRotations[key] = append(p.keyRotations[key], now)
+	p.tracker.count(rotationAttempt)
 
-	candidate, err := p.softRestart(old)
+	candidate, err := p.softRestartIfUseful(old)
 	if err == nil && candidate != nil && !sameEgressPrefix(candidate.egress, old.egress) {
 		if p.placeRotated(old, candidate, false) {
 			p.clearRotationFailureLocked(key)
@@ -114,16 +115,21 @@ func (p *Pool) rotate(old *exit, reason string) {
 			err = errEgressPrefixUnchanged
 		}
 	}
+	if errors.Is(err, errEgressPrefixUnchanged) {
+		p.tracker.count(rotationSamePrefix)
+	}
 	// 放置失败同样走换段重建: soft restart 复用旧注册, 落点常常还在刚被
 	// 惩罚的段上, 只有换段才能真正换掉配额作用域.
 	if errors.Is(err, errEgressPrefixUnchanged) || errors.Is(err, errCannotPlaceRotated) {
 		if !p.takeFullRekeyLocked(now) {
+			p.tracker.count(rotationBudget)
 			p.warnf("WARP full re-key budget exhausted, keeping %s retired", old.egress)
 			return
 		}
 		candidate, err = p.createExit(p.ctx)
 		if err == nil && candidate != nil && !sameEgressPrefix(candidate.egress, old.egress) {
 			if p.placeRotated(old, candidate, true) {
+				p.tracker.count(rotationRekeyed)
 				p.clearRotationFailureLocked(key)
 				p.infof("OpenCode WARP egress %s re-keyed to %s (%s)", old.id, candidate.egress, reason)
 				return
@@ -143,7 +149,16 @@ func (p *Pool) rotate(old *exit, reason string) {
 	}
 
 	delay := p.recordRotationFailureLocked(key, time.Now())
+	p.tracker.count(rotationFailed)
 	p.warnf("WARP rotation for %s failed (%v), keeping %s retired, next attempt after %s", key, err, old.egress, delay)
+}
+
+// softRestartIfUseful 只在能换外层源时复用旧注册.
+func (p *Pool) softRestartIfUseful(old *exit) (*exit, error) {
+	if !p.sourcePrefix.IsValid() || old.stack != StackIPv6 {
+		return nil, errEgressPrefixUnchanged
+	}
+	return p.softRestart(old)
 }
 
 func (p *Pool) softRestart(old *exit) (*exit, error) {

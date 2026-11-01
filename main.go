@@ -47,6 +47,8 @@ func main() {
 		sourceIPv6    = flag.String("source-ipv6", getenv("WARP_SOURCE_IPV6", ""), "外层 IPv6 源前缀 (/64 或更短), 留空则不绑定")
 		recentWindow  = flag.Duration("recent-window", getenvDuration("WARP_RECENT_WINDOW", 10*time.Second), "控制 API 无参惩罚时回看的时间窗口")
 		cooldown      = flag.Duration("cooldown", getenvDuration("WARP_COOLDOWN", warp.DefaultEgressCooldown), "被惩罚的配额段重新可用前的等待时长, 负值表示不冷却")
+		nodeDB        = flag.String("node-db", getenv("WARP_NODE_DB", ""), "节点库落盘路径, 留空关闭跨重启复用")
+		nodeTZ        = flag.String("node-tz", getenv("WARP_NODE_TZ", "America/New_York"), "节点库日界时区")
 		memLimit      = flag.String("mem-limit", getenv("WARP_MEM_LIMIT", "300MiB"), "进程内存上限, 如 300MiB; 0 表示不限制")
 	)
 	flag.Parse()
@@ -95,6 +97,8 @@ func main() {
 		DisableIPv4Fallback: *noFallback,
 		SourceIPv6:          sourcePrefix,
 		EgressCooldown:      *cooldown,
+		NodeDB:              *nodeDB,
+		NodeZone:            *nodeTZ,
 	})
 	if err != nil {
 		logger.Error("WARP pool init failed", "err", err)
@@ -265,9 +269,45 @@ func startControl(ctx context.Context, addr string, pool *warp.Pool, tracker *re
 		status := struct {
 			warp.Snapshot
 			CoolingUntil map[string]time.Time `json:"CoolingUntil"`
-		}{Snapshot: pool.Snapshot(), CoolingUntil: pool.CoolingUntil()}
+			Prefixes     []warp.PrefixStat    `json:"Prefixes"`
+			Rotation     warp.RotationStats   `json:"Rotation"`
+			Nodes        warp.NodeStats       `json:"Nodes"`
+		}{
+			Snapshot:     pool.Snapshot(),
+			CoolingUntil: pool.CoolingUntil(),
+			Prefixes:     pool.Prefixes(),
+			Rotation:     pool.Rotation(),
+			Nodes:        pool.NodeStats(),
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(status)
+	})
+
+	mux.HandleFunc("GET /nodes", func(w http.ResponseWriter, r *http.Request) {
+		body := struct {
+			warp.NodeStats
+			Nodes []warp.NodeView `json:"nodes"`
+		}{NodeStats: pool.NodeStats(), Nodes: pool.NodeViews(200)}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(body)
+	})
+
+	// 成功与 429 由 NovaVeil 按出口 IP 回报, 只记账不换出口.
+	mux.HandleFunc("POST /nodes/success", func(w http.ResponseWriter, r *http.Request) {
+		egress := strings.TrimSpace(r.URL.Query().Get("egress"))
+		matched := pool.MarkNodeSuccess(egress)
+		logger.Debug("node success report", "egress", egress, "matched", matched)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"matched": matched})
+	})
+
+	mux.HandleFunc("POST /nodes/fail", func(w http.ResponseWriter, r *http.Request) {
+		egress := strings.TrimSpace(r.URL.Query().Get("egress"))
+		reason := strings.TrimSpace(r.URL.Query().Get("reason"))
+		matched := pool.MarkNodeFail(egress, reason)
+		logger.Info("node fail report", "egress", egress, "reason", reason, "matched", matched)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]bool{"matched": matched})
 	})
 
 	mux.HandleFunc("POST /penalize", func(w http.ResponseWriter, r *http.Request) {
