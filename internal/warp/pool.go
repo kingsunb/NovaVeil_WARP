@@ -27,6 +27,9 @@ const DefaultEgressCooldown = 60 * time.Second
 // ipv4FallbackBudget 是 v6 失败后改用 v4 重建的时间预算.
 const ipv4FallbackBudget = 60 * time.Second
 
+// 连续 429 达到该值即无新出口.
+const sameEgressPenaltyLimit = 10
+
 // refillRetryDelay spaces out a failed registration attempt. A successful
 // attempt is only limited by the registrar's own pacing.
 const refillRetryDelay = 5 * time.Second
@@ -80,22 +83,25 @@ type Pool struct {
 	stack   Stack
 	newExit func(context.Context) (*exit, error)
 
-	mu        sync.Mutex
-	active    []*exit
-	inflight  int
-	waiting   int
-	next      int
-	reserved  map[string]bool
-	cooling   map[string]time.Time
-	changed   chan struct{}
-	closed    bool
-	refilling bool
-	wait      sync.WaitGroup
-	createMu  sync.Mutex
+	mu             sync.Mutex
+	active         []*exit
+	inflight       int
+	waiting        int
+	next           int
+	reserved       map[string]bool
+	cooling        map[string]time.Time
+	penaltyStrikes map[string]int
+	penaltyResetAt time.Time
+	changed        chan struct{}
+	closed         bool
+	refilling      bool
+	wait           sync.WaitGroup
+	createMu       sync.Mutex
 
 	slots        []slot
 	pins         int
 	sourcePrefix netip.Prefix
+	endpoints    endpointConfig
 	cooldown     time.Duration
 
 	rotateMu         sync.Mutex
@@ -148,6 +154,12 @@ type Options struct {
 	// EgressCooldown 是被惩罚出口再次可用前的等待时长.
 	// 零值即用 DefaultEgressCooldown.
 	EgressCooldown time.Duration
+	// IPv4Pool 启用内置 IPv4 入口池.
+	IPv4Pool bool
+	// IPv4Samples 是 v4 出口随机入口数, 0 不抽样.
+	IPv4Samples int
+	// ExtraEndpoints 是额外入口, 优先于内置池.
+	ExtraEndpoints []string
 }
 
 // NewWithOptions creates a WARP pool whose exits use the selected IP stack and,
@@ -162,6 +174,14 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 	}
 	if opts.SourceIPv6.IsValid() && (!opts.SourceIPv6.Addr().Is6() || opts.SourceIPv6.Bits() > 64) {
 		return nil, fmt.Errorf("WARP outer source must be an IPv6 prefix of /64 or shorter, got %s", opts.SourceIPv6)
+	}
+	if opts.IPv4Samples < 0 || opts.IPv4Samples > 8 {
+		return nil, fmt.Errorf("WARP IPv4 endpoint samples must be between 0 and 8, got %d", opts.IPv4Samples)
+	}
+	endpoints := endpointConfig{
+		ipv4Pool:    opts.IPv4Pool,
+		ipv4Samples: opts.IPv4Samples,
+		extra:       opts.ExtraEndpoints,
 	}
 	size := opts.Size
 	if size <= 0 {
@@ -180,7 +200,7 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 				return nil, err
 			}
 		}
-		candidate, err := newExitWithStack(ctx, reg, normalized, source)
+		candidate, err := newExitWithStack(ctx, reg, normalized, source, endpoints)
 		if err == nil || normalized != StackIPv6 || opts.DisableIPv4Fallback {
 			return candidate, err
 		}
@@ -190,13 +210,14 @@ func NewWithOptions(ctx context.Context, log *slog.Logger, opts Options) (*Pool,
 			log.Warn("WARP IPv6 exit unavailable, falling back to IPv4", "err", err)
 		}
 		// 同一份注册同时含 v4/v6 地址, 兜底无需重新注册.
-		return newExitWithStack(fallbackCtx, reg, StackIPv4, netip.Addr{})
+		return newExitWithStack(fallbackCtx, reg, StackIPv4, netip.Addr{}, endpoints)
 	})
 	if err != nil {
 		return nil, err
 	}
 	pool.stack = normalized
 	pool.sourcePrefix = opts.SourceIPv6
+	pool.endpoints = endpoints
 	pool.cooldown = opts.EgressCooldown
 	if pool.cooldown == 0 {
 		pool.cooldown = DefaultEgressCooldown
@@ -255,6 +276,7 @@ func newPool(ctx context.Context, log logger, size int, minSize int, create func
 		newExit:          create,
 		reserved:         make(map[string]bool),
 		cooling:          make(map[string]time.Time),
+		penaltyStrikes:   make(map[string]int),
 		changed:          make(chan struct{}),
 		slots:            make([]slot, size),
 		keyRotations:     make(map[string][]time.Time),
@@ -361,11 +383,27 @@ func (p *Pool) Size() int { return p.size }
 // (control API) passes the egress address that carried the rejected request.
 func (p *Pool) PenalizeByEgress(addr string, reason string) bool {
 	p.mu.Lock()
+	// UTC 零点后清零。
+	if !p.penaltyResetAt.IsZero() && !time.Now().Before(p.penaltyResetAt) {
+		p.penaltyStrikes = nil
+		p.penaltyResetAt = time.Time{}
+	}
 	var target *exit
 	for _, active := range p.active {
 		if active.egress.IsValid() && active.egress.String() == addr {
 			target = active
 			break
+		}
+	}
+	if target != nil && reason == "429" && addr != "" {
+		if p.penaltyStrikes == nil {
+			p.penaltyStrikes = make(map[string]int)
+		}
+		p.penaltyStrikes[addr]++
+		// 达到阈值后次日 UTC 重置。
+		if p.penaltyStrikes[addr] >= sameEgressPenaltyLimit && p.penaltyResetAt.IsZero() {
+			now := time.Now().UTC()
+			p.penaltyResetAt = time.Date(now.Year(), now.Month(), now.Day()+1, 0, 0, 0, 0, time.UTC)
 		}
 	}
 	p.mu.Unlock()
@@ -374,6 +412,20 @@ func (p *Pool) PenalizeByEgress(addr string, reason string) bool {
 	}
 	p.penalize(target, reason)
 	return true
+}
+
+// PenaltyState 返回出口连续 429 罚次数及是否已达无新出口阈值.
+func (p *Pool) PenaltyState(addr string) (int, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// UTC 零点后清零。
+	if !p.penaltyResetAt.IsZero() && !time.Now().Before(p.penaltyResetAt) {
+		p.penaltyStrikes = nil
+		p.penaltyResetAt = time.Time{}
+		return 0, false
+	}
+	strikes := p.penaltyStrikes[addr]
+	return strikes, strikes >= sameEgressPenaltyLimit
 }
 
 // PenalizeRecent rotates out every active exit whose egress key is in keys.

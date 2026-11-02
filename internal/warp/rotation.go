@@ -155,7 +155,7 @@ func (p *Pool) softRestart(old *exit) (*exit, error) {
 			return nil, err
 		}
 	}
-	return newExitWithStack(p.ctx, old.reg, old.stack, source)
+	return newExitWithStack(p.ctx, old.reg, old.stack, source, p.endpoints)
 }
 
 func (p *Pool) placeRotated(old, candidate *exit, reserved bool) bool {
@@ -192,6 +192,9 @@ func (p *Pool) placeRotated(old, candidate *exit, reserved bool) bool {
 		return false
 	}
 	p.active = append(p.active, candidate)
+	if oldKey := old.egressKey(); oldKey != "" && oldKey != candidate.egressKey() {
+		delete(p.penaltyStrikes, oldKey)
+	}
 	releases := p.bindSlotsLocked()
 	p.notifyLocked()
 	p.mu.Unlock()

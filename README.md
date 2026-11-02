@@ -22,18 +22,32 @@ NovaVeil_WARP 是单容器 Cloudflare WARP 代理，同时提供 SOCKS5（默认
 
 重新注册会换一个 /128，出口按完整地址去重，因此同一 /64 下可以并存多个 /128。但 /64 来自 Cloudflare 的有限分配集合，若上游配额按 /64 计，同段地址仍共享限额。
 
-### 两种 IP 多样性档位
+### IP 多样性档位
 
 | 模式 | 效果 | 要求 |
 |---|---|---|
 | 不开 `source-ipv6` | 每次注册新 /128 出口 IP，但可能落在同一个 /64 内 | 无 |
 | 开 `source-ipv6` | 每个隧道绑定 /64 前缀内随机源地址，不同源 → 不同公网 /64 → 真正跨配额域 | Linux + 宿主机有路由到的 IPv6 /64 |
+| 开 `ipv4-pool` | 每个 v4 出口随机选边缘入口，可能换边缘节点，不保证换公网 v4 | 无 |
 
 ### 地址族：IPv6 优先，IPv4 兜底
 
 默认 `-stack ipv6`。v6 隧道建不起来时（注册不带 v6 地址、外层源绑定失败、v6 探测不通），用**同一份注册**里的 v4 地址重建，不重新注册、不浪费注册间隔。
 
 v4 出口是 Cloudflare NAT 后的共享地址，配额通常已被别人耗尽，所以这档只是保命，不是长久之计。`/status` 的 `Fallback` 字段显示当前有几个出口在走 v4；非零就说明 v6 链路有问题。
+
+### IPv4 入口池
+
+`-ipv4-pool` 只作用于 v4 出口：建隧道时从内置 WARP IPv4 网段随机抽 2 个入口，排在注册下发的入口前面，避免所有出口都挤在同几个边缘节点。`-ipv4-samples` 调整抽样数（0-8，0 表示不抽样），`-endpoints` 可传自己扫描到的入口（优先于内置池，所有地址族通用）。
+
+内置 16 个公开 IPv4 `/24`、54 个公开 WARP 端口；抽样时 `2408` 占多数，其余备用端口用于绕开封锁。免费 WARP 的 v4 出口仍是 Cloudflare NAT 共享地址，换入口只改变边缘节点，不保证公网 v4 出口唯一；需要独占 v4 应改用 Zero Trust 专用出口 IP。
+
+实测同一池内多次注册和轮换仍得到同一 v4 出口，`-stack ipv4` 下出口会因去重只剩 1 个；入口池只解决可达性，不增加出口数量。
+
+```sh
+# 只用 IPv4 出口，并加大入口抽样
+./NovaVeil_WARP -stack ipv4 -ipv4-samples 4
+```
 
 ## 用法
 
@@ -86,6 +100,9 @@ curl -x socks5h://warp-0:any@127.0.0.1:1080 https://api.ipify.org
 | `-no-ipv4-fallback` | `WARP_NO_IPV4_FALLBACK` | `false` | 禁止 v6 建不起来时降级 v4 |
 | `-health-interval` | `WARP_HEALTH_INTERVAL` | `60s` | 周期巡检间隔，`0` 关闭 |
 | `-source-ipv6` | `WARP_SOURCE_IPV6` | 空 | 外层 IPv6 源前缀（/64 或更短） |
+| `-ipv4-pool` | `WARP_IPV4_POOL` | `true` | v4 出口启用内置入口池 |
+| `-ipv4-samples` | `WARP_IPV4_SAMPLES` | `2` | 每个 v4 出口随机前置入口数（0-8） |
+| `-endpoints` | `WARP_ENDPOINTS` | 空 | 额外入口，逗号分隔，优先于内置池 |
 | `-recent-window` | `WARP_RECENT_WINDOW` | `10s` | 无参惩罚回看时间窗口 |
 | `-cooldown` | `WARP_COOLDOWN` | `60s` | 被惩罚出口重新可用前的等待时长，负值表示不冷却 |
 | `-mem-limit` | `WARP_MEM_LIMIT` | `300MiB` | 进程内存上限，`0` 表示不限制 |
@@ -112,7 +129,11 @@ curl -X POST 'http://localhost:1081/penalize?egress=2606:4700:...&reason=429'
 
 # 惩罚最近一次拨号的单个出口（NovaVeil 不知道具体 IP 时）
 curl -X POST http://localhost:1081/penalize
-# {"penalized":1}
+# {"penalized":1,"strikes":1,"no_new_egress":false}
+
+# 同一出口连续 10 次 429 后提示无新出口
+curl -X POST 'http://localhost:1081/penalize?egress=...&reason=429'
+# {"penalized":1,"strikes":10,"no_new_egress":true}
 
 # 主动换桶：淘汰全部在岗出口，后台补新出口
 curl -X POST 'http://localhost:1081/rotate?all=1'
@@ -122,6 +143,8 @@ curl -X POST 'http://localhost:1081/rotate?all=1'
 curl -X POST http://localhost:1081/probe
 # {"dropped":0}
 ```
+
+`strikes` 是同一出口连续收到 429 惩罚的次数，`no_new_egress` 仅在 `reason=429` 且达到 10 次时为真。出口变化会清零计数；达到阈值后计数在下一个 UTC 零点重置。NovaVeil 收到 `no_new_egress` 后把对应渠道停用到 UTC 零点，避免继续消耗已耗尽的出口配额。
 
 被淘汰的出口进入冷却，默认 60 秒后重新可用（`-cooldown` 可调，负值表示不冷却）。冷却期间重新抽到同一地址会被丢弃重抽。冷却取短值是刻意的：换地址成本远低于让池子空掉的成本，早期实现把出口锁到下一个 UTC 0 点（最长 6 小时），一次全池换桶就能把池封死。
 
@@ -211,6 +234,7 @@ http://NovaVeil_WARP_socks5:8080
 NovaVeil 检测到代理地址含 `NovaVeil_WARP_socks5` 时，自动在 429 后向
 `http://NovaVeil_WARP_socks5:1081/penalize` 发异步 POST，淘汰最近一次拨号的出口（单次最多 1 个）并重试。
 惩罚会关闭旧出口上已建立的连接（替换隧道就绪后立即断开），强制客户端重新建连并拿到新 IP；否则长连接会继续复用旧出口。
+同一出口连续 10 次 429 惩罚后，响应带 `no_new_egress=true`；NovaVeil 会把该渠道停用到下一个 UTC 零点再恢复。
 
 ### 3. 工作流程
 
@@ -227,3 +251,4 @@ NovaVeil 重试 → 同一代理地址 → WARP 隧道(IP-B) → 成功
 
 `internal/warp` 改编自 [opencode2api](https://github.com/jasonxu114514/opencode2api) 的 `internal/warp` 包，
 后者改编自 [sudogeeker/ai-route](https://github.com/sudogeeker/ai-route)（MIT 许可）。
+内置 IPv4 入口网段参考 [vernette/warpscout](https://github.com/vernette/warpscout) 与 [bepass-org/warp-plus](https://github.com/bepass-org/warp-plus) 的公开列表。

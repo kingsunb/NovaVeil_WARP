@@ -45,6 +45,9 @@ func main() {
 		noFallback    = flag.Bool("no-ipv4-fallback", getenvBool("WARP_NO_IPV4_FALLBACK", false), "禁止 v6 不可用时降级 v4")
 		healthEvery   = flag.Duration("health-interval", getenvDuration("WARP_HEALTH_INTERVAL", 60*time.Second), "周期巡检间隔, 0 关闭")
 		sourceIPv6    = flag.String("source-ipv6", getenv("WARP_SOURCE_IPV6", ""), "外层 IPv6 源前缀 (/64 或更短), 留空则不绑定")
+		ipv4Pool      = flag.Bool("ipv4-pool", getenvBool("WARP_IPV4_POOL", true), "启用内置 WARP IPv4 入口池")
+		ipv4Samples   = flag.Int("ipv4-samples", getenvInt("WARP_IPV4_SAMPLES", 2), "每个 v4 出口随机前置的入口数 (0-8)")
+		extraEndpoint = flag.String("endpoints", getenv("WARP_ENDPOINTS", ""), "额外 WARP 入口, 逗号分隔")
 		recentWindow  = flag.Duration("recent-window", getenvDuration("WARP_RECENT_WINDOW", 10*time.Second), "控制 API 无参惩罚时回看的时间窗口")
 		cooldown      = flag.Duration("cooldown", getenvDuration("WARP_COOLDOWN", warp.DefaultEgressCooldown), "被惩罚出口重新可用前的等待时长, 负值表示不冷却")
 		memLimit      = flag.String("mem-limit", getenv("WARP_MEM_LIMIT", "300MiB"), "进程内存上限, 如 300MiB; 0 表示不限制")
@@ -87,7 +90,8 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	logger.Info("starting WARP pool", "min", *minPool, "size", *poolSize, "stack", stackType, "source_ipv6", sourcePrefix)
+	logger.Info("starting WARP pool", "min", *minPool, "size", *poolSize, "stack", stackType, "source_ipv6", sourcePrefix,
+		"ipv4_pool", *ipv4Pool, "ipv4_samples", *ipv4Samples, "extra_endpoints", len(parseEndpointList(*extraEndpoint)))
 	pool, err := warp.NewWithOptions(ctx, logger, warp.Options{
 		Size:                *poolSize,
 		MinSize:             *minPool,
@@ -95,6 +99,9 @@ func main() {
 		DisableIPv4Fallback: *noFallback,
 		SourceIPv6:          sourcePrefix,
 		EgressCooldown:      *cooldown,
+		IPv4Pool:            *ipv4Pool,
+		IPv4Samples:         *ipv4Samples,
+		ExtraEndpoints:      parseEndpointList(*extraEndpoint),
 	})
 	if err != nil {
 		logger.Error("WARP pool init failed", "err", err)
@@ -292,9 +299,15 @@ func startControl(ctx context.Context, addr string, pool *warp.Pool, tracker *re
 			}
 		}
 
-		logger.Info("penalize request", "egress", egress, "target", target, "penalized", penalized)
+		strikes, noNewEgress := pool.PenaltyState(target)
+		noNewEgress = noNewEgress && reason == "429"
+		logger.Info("penalize request", "egress", egress, "target", target, "penalized", penalized, "strikes", strikes, "no_new_egress", noNewEgress)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]int{"penalized": penalized})
+		json.NewEncoder(w).Encode(map[string]any{
+			"penalized":     penalized,
+			"strikes":       strikes,
+			"no_new_egress": noNewEgress,
+		})
 	})
 
 	mux.HandleFunc("POST /rotate", func(w http.ResponseWriter, r *http.Request) {
@@ -482,6 +495,17 @@ func startMemoryWatch(ctx context.Context, limit int64, logger *slog.Logger) {
 }
 
 // --- 环境变量辅助 ---
+
+// parseEndpointList 拆分入口列表.
+func parseEndpointList(value string) []string {
+	var out []string
+	for _, item := range strings.Split(value, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
 
 func getenv(key, def string) string {
 	if v := os.Getenv(key); v != "" {

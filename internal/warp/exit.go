@@ -108,14 +108,14 @@ func (c *exitConn) CloseWrite() error {
 }
 
 func newExit(ctx context.Context, reg registration) (*exit, error) {
-	return newExitWithStack(ctx, reg, DefaultStack, netip.Addr{})
+	return newExitWithStack(ctx, reg, DefaultStack, netip.Addr{}, endpointConfig{})
 }
 
 // newExitWithStack builds one userspace tunnel for reg. A valid source pins
 // the outer WireGuard socket to that address and restricts the peer endpoints
 // to IPv6, so the public egress is derived from the rotating source rather than
 // from whatever address the host happens to share.
-func newExitWithStack(ctx context.Context, reg registration, stack Stack, source netip.Addr) (*exit, error) {
+func newExitWithStack(ctx context.Context, reg registration, stack Stack, source netip.Addr, endpoints endpointConfig) (*exit, error) {
 	normalized, err := ParseStack(string(stack))
 	if err != nil {
 		return nil, err
@@ -164,7 +164,7 @@ func newExitWithStack(ctx context.Context, reg registration, stack Stack, source
 		tunDevice.Close()
 		return nil, fmt.Errorf("decode WARP peer key: %w", err)
 	}
-	endpoints, err := resolveEndpoints(ctx, reg.Endpoints, reg.Endpoint)
+	endpointList, err := resolveEndpoints(ctx, endpoints.candidates(reg, stack), reg.Endpoint)
 	if err != nil {
 		tunDevice.Close()
 		return nil, err
@@ -174,12 +174,12 @@ func newExitWithStack(ctx context.Context, reg registration, stack Stack, source
 		// the IPv4 ones behind them: a host (or network) that cannot reach
 		// Cloudflare over IPv6 still gets a working tunnel, just with the
 		// shared address the prefix was supposed to avoid.
-		endpoints = preferIPv6Endpoints(endpoints)
+		endpointList = preferIPv6Endpoints(endpointList)
 	}
 	wg := device.NewDevice(tunDevice, &simpleBind{source: source}, device.NewLogger(device.LogLevelError, "warp: "))
 	uapi := fmt.Sprintf(
 		"private_key=%s\npublic_key=%s\nallowed_ip=0.0.0.0/0\nallowed_ip=::/0\nendpoint=%s\npersistent_keepalive_interval=25\n",
-		privateKey, peerKey, endpoints[0],
+		privateKey, peerKey, endpointList[0],
 	)
 	if err := wg.IpcSet(uapi); err != nil {
 		wg.Close()
@@ -192,14 +192,14 @@ func newExitWithStack(ctx context.Context, reg registration, stack Stack, source
 		return nil, fmt.Errorf("start WARP device: %w", err)
 	}
 	e := &exit{id: reg.ID, stack: stack, device: wg, network: network, reg: reg, source: source}
-	egress, err := e.probe(ctx, wg, peerKey, endpoints)
+	egress, err := e.probe(ctx, wg, peerKey, endpointList)
 	if err != nil {
 		e.close()
 		return nil, err
 	}
 	e.egress = egress
 	e.verify = func(ctx context.Context) (netip.Addr, error) {
-		return e.probe(ctx, wg, peerKey, endpoints)
+		return e.probe(ctx, wg, peerKey, endpointList)
 	}
 	return e, nil
 }
